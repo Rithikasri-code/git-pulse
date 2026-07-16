@@ -1,0 +1,11 @@
+{
+  "port": 4310,
+  "groups": [
+    { "name": "Personal", "repos": [{ "path": "C:\\Users\\you\\Developer\\my-project" }] },
+    { "name": "Work", "repos": [] }
+  ],
+  "rooms": [
+    { "name": "My room", "path": "C:\\Users\\you\\Developer\\my-room", "repos": [] }
+  ],
+  "chat": { "showResults": false }
+}
