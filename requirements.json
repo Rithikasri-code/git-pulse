@@ -1,0 +1,172 @@
+{
+  "version": 1,
+  "padron": "1.4",
+  "blocks": { "registro": "1.0", "ciclo": "1.0", "estado": "1.0", "tareas": "1.3", "entrega": "1.0" },
+  "requirements": [
+    {
+      "id": "base-branch",
+      "title": "Remote base branch exists",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "base-branch" },
+      "remedy": "Make sure the repo has a remote called origin and that its base branch (usually main) is pushed there; if the base branch is not main, set \"base\" for this repo in the panel config."
+    },
+    {
+      "id": "agents-file",
+      "title": "AGENTS.md on the base branch",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "file-exists", "file": "agents" },
+      "remedy": "Create AGENTS.md at the repo root with the project rules, then the user commits it with /flow-commit and opens a PR with /flow-pr."
+    },
+    {
+      "id": "registro-block",
+      "title": "Orquestación 'registro' block in AGENTS.md",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "block", "file": "agents", "name": "registro" },
+      "remedy": "Add the Orquestación 'registro' block (version 1.0) to AGENTS.md exactly as in requirements/blocks/registro.md, between <!-- orquestacion:registro v1.0 --> and <!-- /orquestacion:registro -->; if AGENTS.md has rules that conflict, stop and ask the user."
+    },
+    {
+      "id": "tareas-block",
+      "title": "Panel 'tareas' block in AGENTS.md",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "block", "file": "agents", "name": "tareas", "namespace": "panel" },
+      "remedy": "Add the panel 'tareas' block to AGENTS.md exactly as in requirements/blocks/tareas.md, between its opening and closing markers (a block already there with an older version is replaced where it stands), and remove from AGENTS.md every instruction about how to create or manage tasks (requirements/INSTALL.md step 7): the new mechanism replaces them."
+    },
+    {
+      "id": "entrega-block",
+      "title": "Panel 'entrega' block in AGENTS.md",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "block", "file": "agents", "name": "entrega", "namespace": "panel" },
+      "remedy": "Add the panel 'entrega' block to AGENTS.md exactly as in requirements/blocks/entrega.md, between its opening and closing markers (a block already there with an older version is replaced where it stands), and remove from AGENTS.md every instruction about branches, commits and pull requests for day-to-day work (requirements/INSTALL.md step 8): the new mechanism replaces them. Nothing commits but /flow-commit."
+    },
+    {
+      "id": "roadmap-file",
+      "title": "Roadmap file on the base branch",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "file-exists", "file": "roadmap" },
+      "remedy": "If the repo already tracks tasks somewhere else (a roadmap in another path or format, planning/, task lists kept in files), migrate them into docs/ROADMAP.md instead of keeping a second system (requirements/INSTALL.md step 7). Otherwise create docs/ROADMAP.md (or the roadmap path configured for this repo) with the three header lines and a units table whose header has exactly these column names: `ID`, `Entrega`, `Depende de` and `Estado` (optional: `Resultado visible`, `Notas`, `Ficha`)."
+    },
+    {
+      "id": "roadmap-header",
+      "title": "Roadmap header lines",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "roadmap-header", "file": "roadmap" },
+      "remedy": "Start the roadmap with three lines, in this order: **Dónde está:** ..., **Qué sigue:** ... and **Qué lo bloquea:** ... (exact labels, each at the start of its line)."
+    },
+    {
+      "id": "roadmap-table",
+      "title": "Roadmap units table without errors",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "roadmap-table", "file": "roadmap" },
+      "remedy": "Fix the units table in the roadmap so it has no errors (required columns, one-word states, unique IDs): rename any header that does not match so the table has exactly `ID`, `Entrega`, `Depende de` and `Estado` (a column called `Unidad` or `Dependencias` is not recognised); the panel's Conformity drawer lists the problems. If the repo already tracks tasks in another path or format, migrate them into this table instead of keeping a second system (requirements/INSTALL.md step 7)."
+    },
+    {
+      "id": "ciclo-block",
+      "title": "Orquestación 'ciclo' block in AGENTS.md",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "block", "file": "agents", "name": "ciclo" },
+      "remedy": "Add the Orquestación 'ciclo' block (version 1.0) to AGENTS.md exactly as in requirements/blocks/ciclo.md, between <!-- orquestacion:ciclo v1.0 --> and <!-- /orquestacion:ciclo -->; if AGENTS.md has rules that conflict, stop and ask the user."
+    },
+    {
+      "id": "manual-leftovers",
+      "title": "No manual section that a block replaces in AGENTS.md",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "leftover-sections", "file": "agents" },
+      "remedy": "Replace every leftover section the panel lists (a section of AGENTS.md outside the blocks that restates what a block already says, or that still names /flow-branch) following requirements/INSTALL.md step 3: replace the WHOLE section, keep only the lines the blocks do not say in a short section of the repo, the blocks win, and record in docs/ORQUESTACION.md what was kept."
+    },
+    {
+      "id": "sala-region",
+      "title": "SALA region inside the 'ciclo' block",
+      "category": "verificable",
+      "level": "required",
+      "onlyInRoom": true,
+      "check": { "type": "block-markers", "file": "agents", "name": "ciclo", "markers": ["<!-- SALA -->", "<!-- /SALA -->"] },
+      "remedy": "Restore every region between <!-- SALA --> and <!-- /SALA --> (markers included) inside the 'ciclo' block of AGENTS.md exactly as in requirements/blocks/ciclo.md; this repo belongs to a room, so those lines must stay."
+    },
+    {
+      "id": "adoption-record",
+      "title": "Adoption record docs/ORQUESTACION.md",
+      "category": "verificable",
+      "level": "recommended",
+      "check": { "type": "file-exists", "file": "adoption" },
+      "remedy": "Create docs/ORQUESTACION.md recording how this repo adopted the Orquestación profile: the date of adoption, the profile, the version of each block installed (say when the `ciclo` block was installed without its SALA regions) and every rule not adopted or changed (write none when there is none)."
+    },
+    {
+      "id": "padron-record",
+      "title": "Padrón of the panel recorded in docs/ORQUESTACION.md",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "padron", "file": "adoption" },
+      "remedy": "Once every other requirement of the order is applied, write the line `- **Padrón del panel:** ` followed by the padrón version of requirements.json in docs/ORQUESTACION.md (create the file if it does not exist), as requirements/INSTALL.md step 10 says. It records which version of the panel's rules this repo was put in conditions with, so a later change of the rules marks the repo as outdated."
+    },
+    {
+      "id": "estado-block",
+      "title": "Panel 'estado' block in AGENTS.md",
+      "category": "verificable",
+      "level": "recommended",
+      "check": { "type": "block", "file": "agents", "name": "estado", "namespace": "panel" },
+      "remedy": "Add the panel 'estado' block to AGENTS.md exactly as in requirements/blocks/estado.md, between its opening and closing markers (a block already there with an older version is replaced where it stands); if AGENTS.md has rules that conflict, stop and ask the user."
+    },
+    {
+      "id": "panel-ignored",
+      "title": ".panel/ ignored by Git in this clone",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "panel-ignored" },
+      "remedy": "Every repo must ignore .panel/ in its clone: append the line .panel/ to .git/info/exclude of this repo (create the file if it does not exist); never add it to .gitignore and never commit it. It is local to this clone, so there is nothing to deliver with /flow-commit."
+    }
+  ],
+  "roomRequirements": [
+    {
+      "id": "room-base-branch",
+      "title": "Remote base branch exists",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "base-branch" },
+      "remedy": "Make sure the room repo has a remote called origin and that its base branch (usually main) is pushed there."
+    },
+    {
+      "id": "room-agents-file",
+      "title": "AGENTS.md on the base branch",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "file-exists", "file": "agents" },
+      "remedy": "Create AGENTS.md at the root of the room repo with the rules of the room, then the user commits it with /flow-commit and opens a PR with /flow-pr."
+    },
+    {
+      "id": "room-enlaces-file",
+      "title": "Link map ENLACES.md on the base branch",
+      "category": "verificable",
+      "level": "required",
+      "check": { "type": "file-exists", "files": ["enlaces", "enlacesAlt"] },
+      "remedy": "Create the link map ENLACES.md at the root of the room repo (or under estrategia/) with the projects, contracts, dependencies, orders queue and last sweep of the room."
+    },
+    {
+      "id": "room-enlaces-sections",
+      "title": "Link map sections",
+      "category": "verificable",
+      "level": "required",
+      "check": {
+        "type": "headings",
+        "files": ["enlaces", "enlacesAlt"],
+        "sections": [
+          { "label": "projects", "match": "Proyectos" },
+          { "label": "contracts", "match": "Contratos" },
+          { "label": "dependencies", "match": "Dependencias" },
+          { "label": "queue", "match": "Cola" },
+          { "label": "sweep", "match": "barrido" }
+        ]
+      },
+      "remedy": "Give the link map one markdown heading for each of: Proyectos, Contratos, Dependencias, Cola (de órdenes) and (último) barrido."
+    }
+  ]
+}
