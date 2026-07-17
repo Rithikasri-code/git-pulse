@@ -1,0 +1,15 @@
+{
+  "name": "git-pulse",
+  "version": "0.1.0",
+  "description": "Local single-page dashboard for uncommitted changes, open PRs and CI status across many git repos",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "open": "node server.js --open",
+    "test": "node scripts/run-tests.js"
+  }
+}
