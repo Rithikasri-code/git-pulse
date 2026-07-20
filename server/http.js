@@ -1,0 +1,391 @@
+'use strict';
+// HTTP layer: host and token checks, routes, static files and the server factory.
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const lib = require('../lib.js');
+const view = require('../public/view.js');
+const { HttpError } = require('./errors.js');
+const { firstLine, withContext, withPriority, singleFlight, stats } = require('./exec.js');
+const { createPerf } = require('./perf.js');
+const { fetchRepo } = require('./fetcher.js');
+const { loadConfig, saveConfig, findRepo, roomIssues } = require('./config.js');
+const { resolveRuntime, handshake } = require('./piruntime.js');
+const { localState, diffText } = require('./local.js');
+const { listFiles, readFile } = require('./files.js');
+const { readNotes, saveNotes } = require('./notes.js');
+const { prState, mergePr, rerunFailed } = require('./github.js');
+const { roadmapState } = require('./roadmap.js');
+const { addRepo, removeRepo, setSnoozed, setDismissed, scanFolder } = require('./repos.js');
+const { piSend, rpcPiStatus, sendLock } = require('./pi.js');
+const { readState } = require('./state.js');
+const { requirementsFor, prerequisites } = require('./requirements.js');
+const { roomsState, createRoom, removeRoom, assignRoom } = require('./rooms.js');
+const { queueFor, conformityFor } = require('./queue.js');
+const { summaryFor } = require('./summary.js');
+const { jobsOf } = require('./jobs.js');
+const { subagentsOf } = require('./presence.js');
+const { createSummaryStore } = require('./summarystore.js');
+const { createCodeWatch } = require('./codewatch.js'); // RP201
+const { createEventHub } = require('./events.js');
+const { createNotifier } = require('./notifier.js');
+const { createRpcHost, rpcApi } = require('./rpchost.js');
+const { terminalAnswer } = require('./terminal.js');
+const { readUsage, usageFile } = require('./usage.js');
+const { sessionsState, chatState, chatResult, adoptSession, releaseSession, adoptIfNone } = require('./sessions.js');
+const { readSettings, writeSetting } = require('./settings.js');
+const remote = require('./remote.js');
+const push = require('./push.js');
+
+const ROOT = path.join(__dirname, '..');
+const TOKEN = crypto.randomBytes(24).toString('hex');
+
+// RP76: these POSTs only calculate; every other POST is an action of the person and goes through the interactive lane.
+const READ_ONLY_POSTS = new Set(['POST /api/queue', 'POST /api/conformity']);
+// RP80b: after these actions end (success or failure) the store catches up that repo, fire-and-forget.
+const CATCH_UP_POSTS = new Set(['POST /api/merge', 'POST /api/rerun', 'POST /api/fetch', 'POST /api/pi']);
+// No client, no work: a store that has never been asked (awake() false) is left alone; a store without awake() is always called.
+const catchUp = (store, id) => { if (store && (typeof store.awake !== 'function' || store.awake())) Promise.resolve().then(() => store.catchUp(id)).catch(() => {}); };
+const query = (u) => Object.fromEntries(new URL(u, 'http://x').searchParams);
+
+// What the page may know of the runtimes: ids, labels, versions and state; never a command or a folder.
+const piState = (r) => ({
+  mode: r.mode,
+  active: r.active ? r.active.id : null,
+  ...(r.problem ? { problem: r.problem } : {}),
+  candidates: r.candidates.map((c) => ({ id: c.id, label: c.label, version: c.version, available: c.available, ...(c.reason ? { reason: c.reason } : {}), active: !!(r.active && r.active.id === c.id) })),
+});
+
+// RPC1a: only `auto` or the id of a runtime detected as available can be chosen; the body carries nothing else (no command, no folder).
+async function setPiRuntime(b, deps) {
+  const found = await resolveRuntime(deps);
+  const allowed = new Set(['auto', ...found.candidates.filter((c) => c.available).map((c) => c.id)]);
+  const keys = b && typeof b === 'object' && !Array.isArray(b) ? Object.keys(b) : null;
+  if (!keys || keys.length !== 1 || keys[0] !== 'runtime' || typeof b.runtime !== 'string' || !allowed.has(b.runtime)) throw new HttpError(400, 'runtime must be auto or a detected pi runtime');
+  const cfg = loadConfig();
+  saveConfig({ ...cfg, pi: { ...(cfg.pi || {}), runtime: b.runtime } });
+  return piState(await resolveRuntime(deps));
+}
+
+const routes = {
+  // RP201: ONE boolean (never the fingerprint): true when the files of the server on disk are not the code it started with. It only informs; it is behind the token and the login like every API route.
+  'GET /api/server-state': (q, b, d) => ({ stale: d.codeWatch.stale() === true }),
+  'GET /api/config': () => {
+    const cfg = loadConfig();
+    return {
+      snoozed: cfg.snoozed,
+      dismissed: cfg.dismissed || [],
+      rooms: cfg.rooms || [],
+      roomIssues: roomIssues(cfg),
+      groups: cfg.groups.map((g) => ({
+        name: g.name,
+        repos: g.repos.map((r) => ({ id: lib.repoId(r.path), path: r.path, name: path.basename(r.path) })),
+      })),
+    };
+  },
+  'GET /api/local': (q) => localState(findRepo(q.id)),
+  'GET /api/prs': (q) => prState(findRepo(q.id)),
+  'GET /api/roadmap': (q) => roadmapState(findRepo(q.id)),
+  'GET /api/requirements': (q) => requirementsFor(findRepo(q.id)),
+  'GET /api/state': (q) => readState(findRepo(q.id)),
+  'GET /api/pi-status': (q, b, d) => rpcPiStatus(findRepo(q.id), d.rpcHost), // RPC2-2: `tail` and `fresh` are accepted and ignored
+  'GET /api/rooms': () => roomsState(),
+  'GET /api/summary': (q, b, d) => summaryFor(d, q),
+  // RP80: the board is answered from the store's memory (reads nothing); the refresh answers at once and reads in the background.
+  'GET /api/board': (q, b, d) => {
+    if (!d.summaryStore) throw new HttpError(404, 'No board');
+    if (q.since !== undefined && !/^\d+$/.test(q.since)) throw new HttpError(400, 'since must be an integer >= 0');
+    return d.summaryStore.board(q.since === undefined ? 0 : Number(q.since));
+  },
+  'POST /api/board/refresh': (q, b, d) => {
+    const store = d.summaryStore;
+    if (!store) throw new HttpError(404, 'No board');
+    if (b.id !== undefined && typeof b.id !== 'string') throw new HttpError(400, 'id must be a string');
+    if (b.id !== undefined) findRepo(b.id); // an unknown repo is a 404 before anything starts
+    Promise.resolve().then(() => (b.id === undefined ? store.refreshAll() : store.catchUp(b.id))).catch(() => {});
+    return { started: true };
+  },
+  'GET /api/sessions': (q, b, d) => sessionsState(q.id, d.sessionsDir, d.sessionOf),
+  'GET /api/chat': (q, b, d) => chatState(q.id, q.session, q.limit, d.sessionsDir),
+  // RP106b: the cleaned start of the text of one tool result; 403 unless `chat.showResults` is true in config.json, and never for `read`.
+  'GET /api/chat/result': (q, b, d) => chatResult(q.id, q.call, d.sessionsDir),
+  // RP111b: the options the page may read and write, a CLOSED list (server/settings.js); never the whole configuration.
+  'GET /api/settings': () => readSettings(),
+  // RP118: the line to open the session of a repo in a normal terminal (read only; the server writes it so a folder or an id can never become another command).
+  'GET /api/terminal': (q, b, d) => terminalAnswer(d.rpcHost, q.id),
+  'POST /api/settings': (q, b) => {
+    if (!b || typeof b !== 'object' || Array.isArray(b)) throw new HttpError(400, 'The body must be an object { key, value }');
+    return writeSetting(b.key, b.value);
+  },
+  // RP62: the Claude usage file, read on every request (no cache); a missing or broken file is a normal 200 with available false.
+  'GET /api/usage': (q, b, d) => readUsage({ file: d.usageFile || usageFile() }),
+  'GET /api/prerequisites': (q, b, d) => prerequisites(undefined, d.piRuntime ? () => resolveRuntime(d.piRuntime) : undefined),
+  // RPC1a: spawns nothing unless ?check=1, which starts the active runtime once (`get_state`) and ends it.
+  'GET /api/pi-runtime': async (q, b, d) => {
+    const found = await resolveRuntime(d.piRuntime);
+    const out = piState(found);
+    if (q.check === '1') {
+      // The last check is reused for 5 s (ok or failed): the page cannot make the panel spawn the runtime over and over.
+      const now = d.now || Date.now;
+      const id = found.active ? found.active.id : null;
+      if (!d.piCheck || d.piCheck.id !== id || now() - d.piCheck.at >= 5000) {
+        const check = found.active ? await handshake(found.active, d.piRuntime) : { ok: false, error: found.problem };
+        d.piCheck = { at: now(), id, check };
+      }
+      out.check = d.piCheck.check;
+    }
+    return out;
+  },
+  'POST /api/pi-runtime': (q, b, d) => setPiRuntime(b, d.piRuntime),
+  'GET /api/diff': (q) => diffText(findRepo(q.id)),
+  // RP65: the file explorer; the repo comes only from the config by id, the path is validated and matched against git's own listing.
+  'GET /api/files': (q) => listFiles(findRepo(q.id)),
+  'GET /api/file': (q) => readFile(findRepo(q.id), q.path),
+  // RP93: the notes of a repo, one fixed file (see server/notes.js); the repo comes from the config by id, never a path from the page.
+  'GET /api/notes': (q) => readNotes(findRepo(q.id)),
+  'POST /api/notes': (q, b) => saveNotes(findRepo(b && b.id), b),
+  'POST /api/fetch': async (q, b) => {
+    const repo = findRepo(b.id);
+    const r = await fetchRepo(repo, { prune: true, lane: 'user' });
+    if (r.code !== 0) throw new HttpError(502, firstLine(r.stderr) || 'git fetch failed');
+    return { ok: true };
+  },
+  'POST /api/merge': (q, b) => mergePr(findRepo(b.id), Number(b.number), b.method, !!b.deleteBranch),
+  'POST /api/rerun': (q, b) => rerunFailed(findRepo(b.id), Number(b.number)),
+  'POST /api/snooze': (q, b) => setSnoozed(b.id, Number(b.number), !!b.on, !!b.wasReady),
+  'POST /api/dismiss': (q, b) => setDismissed(b.id, !!b.on),
+  'POST /api/pi': (q, b, d) => piSend(findRepo(b.id), b.command, d.rpcHost, d.requirements, { pr: b.pr, prs: d.prs, lock: d.lock, jobs: d.jobsOf }),
+  // RP99: a session cannot be adopted while the repo has one live or starting (a start takes up to five minutes): it would end with the adopted session in the chat and another one running.
+  'POST /api/sessions/adopt': (q, b, d) => {
+    if (d.rpcHost && d.rpcHost.stateOf(b && b.id) !== 'closed') throw new HttpError(409, 'This repo has a session running: close it first');
+    return adoptSession(b.id, b.session, d.sessionsDir, d.sessionOf);
+  },
+  'POST /api/sessions/release': (q, b, d) => releaseSession(b.id, d.sessionsDir, d.sessionOf),
+  // RPC1b: pi sessions in RPC mode, one per repo; the repo comes from the config by id and no program, folder or argument comes from the page.
+  'POST /api/rpc/start': (q, b, d) => rpcApi(d.rpcHost).start(b),
+  // RP98: closes the session of ONE repo (the process is stopped, also while it starts) and releases its adoption, so the chat comes back to the list of sessions; the repo comes from the config by id.
+  'POST /api/rpc/close': async (q, b, d) => { const status = await rpcApi(d.rpcHost).close(b); await releaseSession(b.id, d.sessionsDir, d.sessionOf); return status; },
+  'POST /api/rpc/prompt': (q, b, d) => rpcApi(d.rpcHost).prompt(b),
+  'POST /api/rpc/steer': (q, b, d) => rpcApi(d.rpcHost).steer(b),
+  'POST /api/rpc/abort': (q, b, d) => rpcApi(d.rpcHost).abort(b),
+  'POST /api/rpc/clear-queue': (q, b, d) => rpcApi(d.rpcHost).clearQueue(b), // RP236
+  'POST /api/rpc/bash': (q, b, d) => rpcApi(d.rpcHost).bash(b), // RP245b: ! and !! from the chat
+  'POST /api/rpc/abort-bash': (q, b, d) => rpcApi(d.rpcHost).abortBash(b), // RP245b: Stop of a running shell command
+  'POST /api/rpc/dialog': (q, b, d) => rpcApi(d.rpcHost).dialog(b),
+  // RPC2b-1: the state of EVERY configured repo (closed by default), from the host's memory: nothing starts and nothing is read.
+  'GET /api/rpc/states': (q, b, d) => ({ states: Object.fromEntries(loadConfig().groups.flatMap((g) => g.repos).map((r) => { const id = lib.repoId(r.path); return [id, d.rpcHost.stateOf(id)]; })) }),
+  'GET /api/rpc/status': (q, b, d) => rpcApi(d.rpcHost).status(q),
+  // RP139: the share of the context window the session uses, as three clean numbers (read-only: it changes no setting of pi).
+  'GET /api/rpc/context': (q, b, d) => rpcApi(d.rpcHost).context(q),
+  // RP140: compacts the context of the session by hand (the server decides if it may; it changes no setting of pi).
+  'POST /api/rpc/compact': (q, b, d) => rpcApi(d.rpcHost).compact(b),
+  'POST /api/queue': (q, b) => queueFor(b),
+  'POST /api/conformity': (q, b) => conformityFor(b),
+  'POST /api/repos': (q, b) => addRepo(b.path, b.group),
+  'POST /api/repos/remove': (q, b) => { removeRepo(b.id); return { ok: true }; },
+  'POST /api/rooms/create': (q, b) => createRoom(b.name, b.path),
+  'POST /api/rooms/remove': (q, b) => removeRoom(b.name),
+  'POST /api/rooms/assign': (q, b) => assignRoom(b.id, b.room),
+  // RP179: Web Push. The key is the PUBLIC one; the private key stays in push.json. A device is only a push-service endpoint (see server/push.js).
+  'GET /api/push/key': (q, b, d) => ({ key: d.pusher.store.vapid().publicKey }),
+  'POST /api/push/subscribe': (q, b, d) => { if (!d.pusher.store.add(b)) throw new HttpError(400, 'Not a push service endpoint, or too many devices'); return { ok: true }; },
+  'POST /api/push/unsubscribe': (q, b, d) => ({ ok: d.pusher.store.remove(b && b.endpoint) }),
+  'POST /api/push/test': async (q, b, d) => ({ sent: await d.pusher.test() }),
+  'GET /api/scan': (q) => ({ repos: scanFolder(q.dir) }),
+};
+
+const STATIC = {
+  '/view.js': ['view.js', 'text/javascript; charset=utf-8'],
+  '/highlight.js': ['highlight.js', 'text/javascript; charset=utf-8'],
+  '/resumen.js': ['resumen.js', 'text/javascript; charset=utf-8'],
+  '/notify.js': ['notify.js', 'text/javascript; charset=utf-8'], // RP178: the pure part of the notifications
+  '/data.js': ['data.js', 'text/javascript; charset=utf-8'],
+  '/feed.js': ['feed.js', 'text/javascript; charset=utf-8'],
+  '/tabs.js': ['tabs.js', 'text/javascript; charset=utf-8'],
+  '/chat.js': ['chat.js', 'text/javascript; charset=utf-8'],
+  '/board.js': ['board.js', 'text/javascript; charset=utf-8'],
+  '/actions.js': ['actions.js', 'text/javascript; charset=utf-8'],
+  '/viewport.js': ['viewport.js', 'text/javascript; charset=utf-8'], // RP180: the visible height on a phone
+  '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
+  '/style.css': ['style.css', 'text/css; charset=utf-8'],
+  '/kletus-dev.svg': ['kletus-dev.svg', 'image/svg+xml'], // RP102: the logo of the header
+  '/icon.svg': ['icon.svg', 'image/svg+xml'], // RP102: the K of the logo, the icon of the tab
+  '/K-icon.svg': ['K-icon.svg', 'image/svg+xml'], // RP185: the base of the person
+  '/apple-touch-icon.png': ['apple-touch-icon.png', 'image/png'],
+  '/icon-192.png': ['icon-192.png', 'image/png'],
+  '/icon-512.png': ['icon-512.png', 'image/png'],
+  '/icon-maskable-512.png': ['icon-maskable-512.png', 'image/png'],
+  '/favicon.ico': ['favicon.ico', 'image/x-icon'],
+  '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'], // RP179: the service worker of the push
+  '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json; charset=utf-8'],
+};
+// RP179: these carry no data, so the remote host serves them without the login (an installed app fetches them before it has a cookie).
+// RP185: the same for the icons of the install (K-icon.svg is only the base and stays behind the login).
+const OPEN_STATIC = new Set(['/sw.js', '/manifest.webmanifest', '/icon.svg', '/apple-touch-icon.png', '/icon-192.png', '/icon-512.png', '/icon-maskable-512.png', '/favicon.ico']);
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (c) => { data += c; if (data.length > 1e6) { reject(new HttpError(413, 'Body too large')); req.destroy(); } });
+    req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new HttpError(400, 'Invalid JSON')); } });
+  });
+}
+
+const send = (res, status, body, type = 'application/json; charset=utf-8', extra = {}) => {
+  res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...extra });
+  res.end(typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body));
+};
+
+function isPanelRunning(port) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port, path: '/health', timeout: 1500 }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => { try { resolve(JSON.parse(data).app === 'repo-panel'); } catch { resolve(false); } });
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(false));
+  });
+}
+
+// `deps` replaces what the pi routes talk to ({ wait, requirements, prs, lock, jobsOf, summaryStore, noSummaryStore }); tests inject fakes, the real server passes none.
+function createServer(port, deps = {}) {
+  // RP234: one send lock per server (tests may inject theirs).
+  deps = { lock: sendLock(), ...deps };
+  // RP201: the fingerprint of the code of the server is taken here, right after its modules were loaded; GET /api/server-state tells whether the disk has another code now (tests inject theirs).
+  if (!deps.codeWatch) deps.codeWatch = createCodeWatch({ root: ROOT });
+  const hostOk = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
+  // RP177: the remote host of config.json (read per request, so editing it needs no restart) and its login; 127.0.0.1 never goes through them.
+  const clock = deps.now || Date.now;
+  const limiter = remote.createLoginLimiter({ now: clock });
+  const remoteCfg = () => remote.remoteOf(loadConfig());
+  const hostKind = (req, rem) => remote.classify(req.headers.host, hostOk, rem, port);
+  // null when the request may go on, else the refusal. A remote host with no valid cookie gets nothing but the login.
+  const refusal = (req, rem) => {
+    const kind = hostKind(req, rem);
+    if (!kind) return { status: 403, error: 'Forbidden host' };
+    if (kind === 'remote' && !remote.isAuthed(req, rem.secret, clock())) return { status: 401, error: 'Login required' };
+    return null;
+  };
+  async function login(req, res, rem) {
+    if (limiter.locked()) return send(res, 429, { error: 'Too many attempts' });
+    const body = await readBody(req);
+    if (!remote.secretOk(body && body.secret, rem.secret)) { limiter.fail(); return send(res, 401, { error: 'Wrong secret' }); }
+    limiter.success();
+    return send(res, 200, { ok: true }, undefined, { 'set-cookie': remote.sessionCookie(remote.signSession(rem.secret, clock()), req.headers['x-forwarded-proto'] === 'https') });
+  }
+  const perf = createPerf();
+  const flights = new Map();
+  const hub = deps.hub || createEventHub();
+  // RPC1b: the pi sessions live in this process (a restart ends them; they come back with the same --session-id). Their events go to the hub as `rpc`.
+  if (!deps.rpcHost) deps.rpcHost = createRpcHost({ resolve: deps.rpcResolve || (() => resolveRuntime(deps.piRuntime)), repoOf: findRepo, publish: (id, payload) => hub.emit('rpc', id, payload), adopt: adoptIfNone, createClient: deps.rpcClient });
+  // RPC2b-1: the session state of every repo is the host's (a synchronous read of memory); an injected host with no stateOf leaves the session `unknown`.
+  if (!deps.sessionOf && typeof deps.rpcHost.stateOf === 'function') deps.sessionOf = (id) => deps.rpcHost.stateOf(id);
+  // RP161: the background jobs a session waits for, counted from its session file; only for a session the panel started (`startedAtOf`); an injected host with none leaves them out.
+  if (!deps.jobsOf && typeof deps.rpcHost.startedAtOf === 'function') deps.jobsOf = (id) => jobsOf(id, deps.rpcHost.startedAtOf(id), deps.sessionsDir);
+  // RP164: what the subagents of that session do, read from the presence folder next to the sessions one (shown only, never a hold); only for a session the panel started, like the jobs.
+  if (!deps.subagentsOf && typeof deps.rpcHost.startedAtOf === 'function') deps.subagentsOf = (id) => (typeof deps.rpcHost.startedAtOf(id) === 'number' ? subagentsOf(id, { base: deps.sessionsDir }) : null);
+  // RP228: how the last task of a free session ended, from the host's events (memory only); an injected host with none leaves it out.
+  if (!deps.outcomeOf && typeof deps.rpcHost.outcomeOf === 'function') deps.outcomeOf = (id) => deps.rpcHost.outcomeOf(id);
+  // RP78: the Summary comes from a store kept in memory (server.js starts it); injected by tests, or off with noSummaryStore. Built AFTER the host: it reads its state.
+  if (!deps.summaryStore && !deps.noSummaryStore) deps.summaryStore = createSummaryStore({ deps, now: deps.now, sessionOf: deps.sessionOf, jobsOf: deps.jobsOf, subagentsOf: deps.subagentsOf, outcomeOf: deps.outcomeOf });
+  // RP178: tells the connected pages when a repo starts to need the person; started with the store by server.js, so a test server runs no timer.
+  // RP179: push.json lives next to config.json; while a device is subscribed the notifier keeps reading with no page open.
+  const pushFile = path.join(process.env.REPO_PANEL_CONFIG ? path.dirname(process.env.REPO_PANEL_CONFIG) : ROOT, 'push.json');
+  const pusher = push.createPusher({ store: push.createPushStore({ file: pushFile, now: deps.now }), post: deps.pushPost || push.post, now: deps.now, sub: () => { const r = remoteCfg(); return r ? `https://${r.host}` : undefined; } });
+  deps.pusher = pusher;
+  const notifier = deps.summaryStore ? createNotifier({ store: deps.summaryStore, hub, hasSubscribers: () => pusher.store.count() > 0, onNotice: (id, n) => { pusher.notify(id, n); } }) : null;
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url.split('?')[0] === '/api/events') return openStream(req, res);
+    const t0 = Date.now();
+    const ctx = { procs: 0, waitMs: 0 };
+    // A URL the parser rejects (`//`, `http://[`) must answer an error, never throw outside the try below and take the panel down.
+    let pathname = '/';
+    let badUrl = false;
+    try { pathname = new URL(req.url, 'http://x').pathname; } catch { badUrl = true; }
+    const key = `${req.method} ${pathname}`;
+    const priority = (req.method === 'POST' && !READ_ONLY_POSTS.has(key)) || (req.method === 'GET' && req.headers['x-priority'] === 'user') ? 'user' : 'background';
+    let executed = true;
+    // Every JSON answer is timed (errors too); GET /api/perf does not record itself.
+    const reply = (status, body, type) => {
+      const ms = Date.now() - t0;
+      const json = !type;
+      // The page, its assets and /health are not API calls; only API routes (and unknown /api/ paths) are timed.
+      if (key !== 'GET /api/perf' && pathname.startsWith('/api/')) perf.record({ route: routes[key] ? key : `${req.method} (other)`, ms, waitMs: ctx.waitMs, procs: ctx.procs, priority, executed });
+      const timing = json ? { 'server-timing': `total;dur=${ms}${ctx.waitMs > 0 ? `, queue;dur=${ctx.waitMs}` : ''}` } : {};
+      return send(res, status, body, type, timing);
+    };
+    return withContext(ctx, () => withPriority(priority, async () => {
+      try {
+        // Blocks DNS-rebinding: only our own host names (and the configured remote one, behind its login) are served.
+        const rem = remoteCfg();
+        if (!hostKind(req, rem)) throw new HttpError(403, 'Forbidden host');
+        // RP177: a POST that names another origin is a cross-site one.
+        if (req.method === 'POST' && !remote.originOk(req)) throw new HttpError(403, 'Forbidden origin');
+        if (badUrl) throw new HttpError(400, 'Bad request');
+        if (hostKind(req, rem) === 'remote' && req.method === 'POST' && pathname === '/login') return await login(req, res, rem);
+        const denied = pathname === '/health' || (req.method === 'GET' && OPEN_STATIC.has(pathname)) ? null : refusal(req, rem);
+        if (denied) {
+          if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) return reply(denied.status, remote.LOGIN_PAGE, 'text/html; charset=utf-8');
+          throw new HttpError(denied.status, denied.error);
+        }
+        if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
+          const html = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8').replace('__TOKEN__', TOKEN);
+          return reply(200, html, 'text/html; charset=utf-8');
+        }
+        if (req.method === 'GET' && STATIC[pathname]) {
+          const [file, type] = STATIC[pathname];
+          return reply(200, fs.readFileSync(path.join(ROOT, 'public', file), type.startsWith('image/') && type !== 'image/svg+xml' ? undefined : 'utf8'), type);
+        }
+        // Lets a second launch tell "my own panel is already here" from "another project owns the port".
+        if (req.method === 'GET' && pathname === '/health') return reply(200, { app: 'repo-panel', api: view.API_VERSION });
+        // RP179: the service worker has no token; it is behind the Host and login gate above and only gets what was queued for its own endpoint.
+        if (key === 'POST /push/pending') { const b = await readBody(req); return reply(200, { notices: pusher.store.take(b && b.endpoint) }); }
+        const handler = routes[key];
+        if (!handler && key !== 'GET /api/perf') throw new HttpError(404, 'Not found');
+        if (req.headers['x-token'] !== TOKEN) throw new HttpError(401, 'Invalid token');
+        if (!handler) return reply(200, { routes: perf.summary(), queue: stats() });
+        const body = req.method === 'POST' ? await readBody(req) : {};
+        const run = async () => {
+          executed = true;
+          try { return await handler(query(req.url), body, deps); } finally { if (CATCH_UP_POSTS.has(key)) catchUp(deps.summaryStore, body && body.id); }
+        };
+        // Identical GETs in flight share one execution; POSTs never do.
+        if (req.method !== 'GET') return reply(200, await run());
+        executed = false;
+        // The lane is part of the key: an interactive request never joins a background one that may have waited in the queue.
+        return reply(200, await singleFlight(flights, `${priority}|${req.url}`, run));
+      } catch (e) {
+        return reply(e.status || 500, { error: e.message || 'Internal error' });
+      }
+    }));
+  });
+  // RP77b: GET /api/events is long-lived, so it skips perf and singleFlight; the token is read ONLY from the x-token header (never the URL).
+  function openStream(req, res) {
+    const denied = refusal(req, remoteCfg());
+    if (denied) return send(res, denied.status, { error: denied.error });
+    if (req.headers['x-token'] !== TOKEN) return send(res, 401, { error: 'Invalid token' });
+    for (const [k, v] of Object.entries({ 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })) res.setHeader(k, v);
+    if (hub.add(res)) return undefined;
+    res.removeHeader('connection');
+    return send(res, 503, { error: 'Too many event streams open' });
+  }
+  const close = server.close.bind(server);
+  // RP238: the callback waits for the pi sessions too (each one gets its grace to exit by itself).
+  server.close = (cb) => {
+    if (notifier) notifier.stop();
+    hub.closeAll();
+    const gone = Promise.resolve(deps.rpcHost.closeAll({ final: true })).catch(() => {});
+    if (deps.summaryStore) deps.summaryStore.stop();
+    return close((err) => { gone.then(() => { if (cb) cb(err); }); });
+  };
+  server.hub = hub;
+  server.rpcHost = deps.rpcHost;
+  server.summaryStore = deps.summaryStore;
+  server.notifier = notifier;
+  server.pusher = pusher;
+  return server;
+}
+
+module.exports = { createServer, isPanelRunning };
