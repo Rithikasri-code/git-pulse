@@ -1,0 +1,243 @@
+'use strict';
+// GET /api/summary: one read-only row per configured repo (progress, session, next unit, what blocks it, last movement and
+// the one main action). It only reuses what the other routes already read; the session comes from the RPC host. A repo whose git or gh read fails gets an error row and the others are unaffected.
+const path = require('node:path');
+const lib = require('../lib.js');
+const { MAX_JOBS } = require('./jobs.js');
+const { sanitize: subagentsClean } = require('./presence.js');
+const V = require('../public/view.js');
+const { git } = require('./exec.js');
+const { loadConfig } = require('./config.js');
+const { localState } = require('./local.js');
+const { prState } = require('./github.js');
+const { roadmapState } = require('./roadmap.js');
+const { readState } = require('./state.js');
+
+const POOL = 6;
+const CACHE_MS = 10 * 1000;
+const MAX_BLOCKING = 3;
+const SESSION_OF = { closed: 'none', idle: 'free', busy: 'working', starting: 'working', asking: 'waiting' };
+const ANSWER = 'Answer the question in the session';
+// Urgency for the filter, lower is more urgent: a session asking you 0, failing CI 1, then the workQueue kinds in their own order
+// (lib.QUEUE_RANK plus 2), then a working session, a blocked unit and everything else.
+const QUEUE_BASE = 2;
+const WORKING = QUEUE_BASE + Math.max(...Object.values(lib.QUEUE_RANK)) + 1;
+
+const caches = new WeakMap();
+
+// RP161: next to the state, how many background jobs the session still waits for: only for a live session and only a positive integer (at most MAX_JOBS); absent otherwise, so a row with none is the row of always.
+const LIVE_STATES = ['free', 'working', 'waiting'];
+const LIVE_RAW = ['idle', 'busy', 'starting', 'asking'];
+// RP164: and, for a live session too, what its subagents do (`subagents`, the closed shape of server/presence.js, only when it passes that gate); absent otherwise, so a row with none is the row of always.
+// RP228: and, for a free session only, how its last task ended (`last`, { kind, at }), for 15 minutes; absent otherwise.
+const LAST_MS = 15 * 60 * 1000;
+const LAST_KINDS = ['done', 'failed', 'stopped'];
+const lastOf = (outcome, now) => (outcome && LAST_KINDS.includes(outcome.kind) && Number.isFinite(outcome.at) && outcome.at <= now && now - outcome.at <= LAST_MS ? { kind: outcome.kind, at: new Date(outcome.at).toISOString() } : null);
+const sessionOf = (s, jobs, subagents, outcome, now) => {
+  const state = SESSION_OF[s] || 'unknown';
+  const live = LIVE_STATES.includes(state);
+  const n = live && Number.isSafeInteger(jobs) && jobs > 0 ? Math.min(jobs, MAX_JOBS) : 0;
+  const subs = live ? subagentsClean(subagents) : null;
+  const last = state === 'free' ? lastOf(outcome, now) : null;
+  return { state, ...(n ? { jobs: n } : {}), ...(subs ? { subagents: subs } : {}), ...(last ? { last } : {}) };
+};
+// The number a getter gives for one repo; a getter that throws is no jobs.
+function jobsFrom(getter, id) {
+  try { return getter(id); } catch { return 0; }
+}
+// The presence summary a getter gives for one repo; a getter that throws is none (the gate in sessionOf decides what is worth showing).
+function subagentsFrom(getter, id) {
+  try { return getter(id); } catch { return null; }
+}
+// The outcome a getter gives for one repo; a getter that throws is none.
+function outcomeFrom(getter, id) {
+  try { return getter(id); } catch { return null; }
+}
+const noProgress = { total: null, completada: null, enRevision: null, bloqueada: null, pendiente: null, enCurso: null };
+
+// Every row counts once: Completada and Bloqueada as written, then the derived En revisión, then En curso (derived or
+// written), then Pendiente (a derived Lista stays here). A row with an unknown state only counts in `total`.
+function progressOf(rm) {
+  if (!rm || rm.available !== true || !Array.isArray(rm.rows)) return noProgress;
+  const derived = rm.derived || {};
+  const out = { total: rm.rows.length, completada: 0, enRevision: 0, bloqueada: 0, pendiente: 0, enCurso: 0 };
+  for (const r of rm.rows) {
+    const d = derived[r.id] && derived[r.id].state;
+    if (r.estado === 'Completada') out.completada++;
+    else if (r.estado === 'Bloqueada') out.bloqueada++;
+    else if (d === 'En revisión') out.enRevision++;
+    else if (d === 'En curso' || r.estado === 'En curso') out.enCurso++;
+    else if (r.estado === 'Pendiente') out.pendiente++;
+  }
+  return out;
+}
+
+const waitsOf = (r) => ({ unit: r.id, waitsFor: r.dependsOn.slice(), external: r.externalDeps.slice() });
+
+// Bloqueada rows, then, when nothing can be taken, the first Pendiente row with unmet table dependencies.
+function blockingOf(rm) {
+  if (!rm || rm.available !== true || !Array.isArray(rm.rows)) return [];
+  const done = new Set(rm.rows.filter((r) => r.estado === 'Completada').map((r) => r.id));
+  const out = rm.rows.filter((r) => r.estado === 'Bloqueada').map(waitsOf);
+  if (!rm.next) {
+    const stuck = rm.rows.find((r) => r.estado === 'Pendiente' && r.dependsOn.some((id) => !done.has(id)));
+    if (stuck) out.push({ ...waitsOf(stuck), waitsFor: stuck.dependsOn.filter((id) => !done.has(id)) });
+  }
+  return out.slice(0, MAX_BLOCKING);
+}
+
+const LABELS = {
+  merge: (a) => `Merge #${a.pr}${a.title ? ` ${a.title}` : ''}`,
+  branch: () => 'Start from a fresh base branch (/flow-base)',
+  manual: (a) => a.reason,
+  waiting: (a) => (a.next ? `Waiting: ${a.next}` : `Waiting: ${a.state}`),
+  deliver: () => 'Deliver the changes (/flow-ship, /flow-pr)',
+  start: (a) => `Start ${a.unit.id}${a.unit.entrega ? `: ${a.unit.entrega}` : ''}`,
+};
+
+// The first entry of lib.workQueue for this repo; a session waiting for an answer comes before all of it.
+function actionOf(f, session, next) {
+  if (session.state === 'waiting') return { kind: 'answer', label: ANSWER, pr: null };
+  const prs = (f.prs && f.prs.prs) || [];
+  const snoozed = new Set(f.snoozed || []);
+  const flags = V.queueFlags(f.local, f.state, null, { now: f.now });
+  const [a] = lib.workQueue([{
+    id: f.repo.id, name: f.repo.name, ...flags,
+    ready: prs.filter((p) => p.ready && !snoozed.has(`${f.repo.id}:${p.number}`)).map((p) => ({ number: p.number, title: p.title })),
+    stale: !!(f.prs && f.prs.stale), dirty: f.local.files.length > 0, unpushed: (f.local.ahead || 0) > 0, hasPrs: V.taskPrs(prs, f.roadmap && f.roadmap.available === true ? f.roadmap.rows : null, { branch: f.local.branch }).length > 0, // RP138: a pull request that is nobody's task does not hide the start
+    next: next ? { id: next.id, entrega: next.entrega } : null,
+  }]);
+  return a ? { kind: a.kind, label: LABELS[a.kind](a), pr: a.kind === 'merge' ? a.pr : null } : null;
+}
+
+function rankOf(session, failingCi, action, blocking) {
+  if (session.state === 'waiting') return 0;
+  if (failingCi) return 1;
+  if (action && action.kind in lib.QUEUE_RANK) return QUEUE_BASE + lib.QUEUE_RANK[action.kind];
+  if (session.state === 'working') return WORKING;
+  return blocking.length ? WORKING + 1 : WORKING + 2;
+}
+
+// The row of one repo and why it needs attention (a list of reasons, empty when it does not).
+function analyse(f) {
+  const { id, name, group, room } = f.repo;
+  const session = sessionOf(f.session, f.jobs, f.subagents, f.outcome, f.now);
+  const error = f.error || (f.local && f.local.error) || (f.prs && f.prs.error) || null;
+  const last = f.last && f.last.at ? { at: f.last.at, what: f.last.what ?? null } : { at: null, what: null };
+  if (error || !f.local || !f.prs) {
+    return { row: { id, name, group, room: room ?? null, branch: null, progress: noProgress, session, next: null, blocking: [], lastMovement: last, action: null, error: String(error || 'No data'), needs: false, rank: WORKING + 2 }, why: [] };
+  }
+  const rm = f.roadmap;
+  const nx = rm && rm.available === true ? rm.next : null;
+  const next = nx ? { id: nx.id, entrega: nx.entrega, resultadoVisible: nx.resultadoVisible } : null;
+  const blocking = blockingOf(rm);
+  const why = [];
+  if (session.state === 'waiting') why.push('The session is waiting for an answer');
+  const failingCi = (f.prs.prs || []).filter((p) => p.checks && p.checks.state === 'failed');
+  for (const p of failingCi) why.push(`PR #${p.number} has failing checks`);
+  // A Blocked unit only needs attention when nothing else can be taken (S58); `blocking` and `rank` do not change.
+  if (!nx && rm && rm.available === true && rm.rows.some((r) => r.estado === 'Bloqueada')) why.push(`Blocked: ${blocking.filter((b) => rm.rows.find((r) => r.id === b.unit && r.estado === 'Bloqueada')).map((b) => b.unit).join(', ')}`);
+  const action = actionOf(f, session, nx);
+  const row = {
+    id, name, group, room: room ?? null, branch: f.local.branch ?? null, progress: progressOf(rm), session, next, blocking,
+    lastMovement: last, action, error: null, needs: why.length > 0, rank: rankOf(session, failingCi.length > 0, action, blocking),
+  };
+  return { row, why };
+}
+
+const summarize = (facts) => analyse(facts).row;
+
+// analyse runs outside the per-repo isolation of gather: an exception in it is that repo's error row, never the summary's.
+function safeAnalyse(f) {
+  try { return analyse(f); } catch (e) { return analyse({ repo: f.repo, last: f.last, session: f.session, error: e.message || 'Analysis failed' }); }
+}
+
+// The state a getter gives for one repo; a getter that throws is unknown, never closed.
+function stateFrom(getter, id) {
+  try { return getter(id); } catch { return 'unknown'; }
+}
+
+async function lastMovementOf(repo, gitRun) {
+  const r = await gitRun(repo.path, ['log', '-1', '--format=%cI%n%s', 'HEAD']).catch(() => null);
+  if (!r || r.code !== 0) return null;
+  const [at, ...subject] = r.stdout.split('\n');
+  return /^\d{4}-\d\d-\d\dT/.test(at) ? { at: at.trim(), what: subject.join(' ').trim() } : null;
+}
+
+async function gather(repo, ctx) {
+  const { deps, cfg } = ctx;
+  // The session is the RPC host's state; without a getter it is unknown.
+  const sessionIn = () => (deps.sessionOf ? stateFrom(deps.sessionOf, repo.id) : 'unknown');
+  const f = { repo: { id: repo.id, name: path.basename(repo.path), group: repo.group, room: ctx.roomOf.get(repo.id) || null }, snoozed: cfg.snoozed, now: ctx.now };
+  try {
+    const [local, prs, roadmap, state, session, last] = await Promise.all([
+      (deps.local || localState)(repo), (deps.prs || prState)(repo), (deps.roadmap || roadmapState)(repo),
+      (deps.state || readState)(repo), sessionIn(), lastMovementOf(repo, deps.git || git),
+    ]);
+    const jobs = deps.jobsOf && LIVE_RAW.includes(session) ? jobsFrom(deps.jobsOf, repo.id) : 0; // RP161: only a live session can wait for a job
+    const subagents = deps.subagentsOf && LIVE_RAW.includes(session) ? subagentsFrom(deps.subagentsOf, repo.id) : null; // RP164: shown, never a hold
+    const outcome = deps.outcomeOf && session === 'idle' ? outcomeFrom(deps.outcomeOf, repo.id) : null; // RP228: only a free session shows how its last task ended
+    return { ...f, local, prs, roadmap, state, session, jobs, subagents, outcome, last };
+  } catch (e) {
+    return { ...f, error: e.message || 'Read failed', session: 'unknown' };
+  }
+}
+
+// At most `size` tasks in flight; results keep the order of `items`.
+async function pool(items, size, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, async () => {
+    while (i < items.length) { const at = i++; out[at] = await fn(items[at]); }
+  }));
+  return out;
+}
+
+// The summary of a list of { row, why }: counts classify each repo once (error rows are not counted); shared with the store snapshot.
+function tally(results, now) {
+  const counts = { working: 0, waiting: 0, blocked: 0, idle: 0 };
+  for (const { row } of results) {
+    if (row.error) continue;
+    if (row.session.state === 'waiting') counts.waiting++;
+    else if (row.session.state === 'working') counts.working++;
+    else if (row.blocking.length) counts.blocked++;
+    else counts.idle++;
+  }
+  return {
+    rows: results.map((r) => r.row), counts,
+    attention: results.filter((r) => r.why.length).map(({ row, why }) => ({ id: row.id, name: row.name, why: why.join('; ') })),
+    generatedAt: new Date(now).toISOString(),
+  };
+}
+
+// RP78: the row of a repo whose facts have not all been read yet. It counts as idle, needs nothing and sorts after every real row.
+const loadingRow = ({ id, name, group, room }) => ({
+  id, name, group, room: room ?? null, loading: true, branch: null, progress: noProgress, session: { state: 'unknown' }, next: null,
+  blocking: [], lastMovement: { at: null, what: null }, action: null, error: null, needs: false, rank: WORKING + 3,
+});
+
+async function build(deps) {
+  const cfg = loadConfig();
+  const now = (deps.now || Date.now)();
+  const roomOf = new Map((cfg.rooms || []).flatMap((r) => r.repos.map((id) => [id, r.name])));
+  const repos = cfg.groups.flatMap((g) => g.repos.map((r) => ({ ...r, id: lib.repoId(r.path), group: g.name })));
+  return tally(await pool(repos, POOL, async (repo) => safeAnalyse(await gather(repo, { deps, cfg, roomOf, now }))), now);
+}
+
+// `deps` replaces what the route talks to ({ sessionOf, prs, local, roadmap, state, git, now, summaryStore }); the cache lives with `deps`.
+function summaryFor(deps = {}, query = {}) {
+  // RP78: with a store the answer is its snapshot, at once; ?fresh=1 reads everything again first.
+  const store = deps.summaryStore;
+  if (store) return query.fresh === '1' ? store.refreshAll().then(() => store.snapshot()) : Promise.resolve(store.snapshot());
+  const now = (deps.now || Date.now)();
+  const hit = caches.get(deps);
+  // t stays null while the build runs (that promise is shared) and is the time it FINISHED once it resolves.
+  if (hit && query.fresh !== '1' && (hit.t === null || now - hit.t < CACHE_MS)) return hit.p;
+  const p = build(deps);
+  const entry = { t: null, p };
+  caches.set(deps, entry);
+  p.then(() => { entry.t = (deps.now || Date.now)(); }, () => { if (caches.get(deps) === entry) caches.delete(deps); });
+  return p;
+}
+
+module.exports = { jobsFrom, subagentsFrom, outcomeFrom, LIVE_RAW, stateFrom, summarize, summaryFor, safeAnalyse, tally, loadingRow, lastMovementOf, pool };
