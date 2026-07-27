@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="token" content="__TOKEN__">
+  <title>Kletus.dev</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="outdated" class="outdated" hidden>The panel server is out of date or out of sync with this page. Restart the panel, then reload the page.</div>
+  <div id="stale" class="outdated" role="status" hidden>The panel server is running older code than the files on disk. Restart the panel (tray menu, Restart panel) to load it.</div>
+  <div id="stalled" class="stalled" role="status" hidden>Not updating. The data may be out of date. Check the panel server or your connection.</div>
+  <header>
+    <h1><picture><source media="(max-width: 759.98px)" srcset="/K-icon.svg"><img src="/kletus-dev.svg" alt="Kletus.dev"></picture></h1>
+    <nav class="rs-tabs" role="tablist" aria-label="Views">
+      <button type="button" role="tab" id="tab-summary" data-act="tab" data-tab="summary" aria-selected="true" aria-controls="summary"><svg class="tab-ic" viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.5" width="12" height="4.2" rx="1.2"/><rect x="2" y="9.3" width="12" height="4.2" rx="1.2"/></svg><span class="tab-tx">Sessions</span></button>
+      <button type="button" role="tab" class="tab-dual" id="tab-conformity" data-act="tab" data-tab="conformity" aria-selected="false" aria-controls="conformityView" aria-label="Conformity" title="Conformity"><svg class="tab-ic" viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.6 13.5 3.6v4.1c0 3-2.3 5.4-5.5 6.7C4.8 13.1 2.5 10.7 2.5 7.7V3.6z"/><path d="m5.6 8 1.7 1.7 3.2-3.4"/></svg><span class="tab-tx">Conformity</span><span id="confBadge" class="badge" hidden></span></button>
+      <button type="button" role="tab" class="tab-dual" id="tab-settings" data-act="tab" data-tab="settings" aria-selected="false" aria-controls="settingsView" aria-label="Settings" title="Settings"><svg class="tab-ic" viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true"><path d="M13.09 6.20 L14.86 6.61 L14.86 9.39 L13.09 9.80 L12.87 10.33 L13.83 11.87 L11.87 13.83 L10.33 12.87 L9.80 13.09 L9.39 14.86 L6.61 14.86 L6.20 13.09 L5.67 12.87 L4.13 13.83 L2.17 11.87 L3.13 10.33 L2.91 9.80 L1.14 9.39 L1.14 6.61 L2.91 6.20 L3.13 5.67 L2.17 4.13 L4.13 2.17 L5.67 3.13 L6.20 2.91 L6.61 1.14 L9.39 1.14 L9.80 2.91 L10.33 3.13 L11.87 2.17 L13.83 4.13 L12.87 5.67 Z"/><circle cx="8" cy="8" r="2.1"/></svg><span class="tab-tx">Settings</span></button>
+    </nav>
+    <span class="spacer"></span>
+    <span id="usage" class="usage" role="status" tabindex="0" hidden></span>
+  </header>
+  <div class="viewbar" id="viewbar">
+    <div class="shared" role="group" aria-label="Shared filters">
+      <input id="search" type="search" placeholder="Filter repos…">
+      <select id="groupFilter"></select>
+      <div id="scope" class="rs-scope" role="group" aria-label="Scope"></div>
+    </div>
+    <span class="spacer"></span>
+    <div id="workTools" class="own">
+      <label class="opt" title="Show the Clean column on the board instead of the collapsible Idle bar">
+        <input id="cleanAsColumn" type="checkbox" data-pref="cleanAsColumn"> Clean column</label>
+      <button id="alerts" class="alerts" data-act="toggle-problems" title="PRs that need a fix (failed checks, conflicts, outdated branch) — click to show only those" hidden></button>
+    </div>
+  </div>
+  <div id="sumLayout" class="chatlayout">
+    <div id="listCol">
+      <div id="listHead" role="group" aria-label="Repo filters">
+        <div class="lh-bar">
+          <div id="lhTitle" class="lh-title"><b>REPOS</b> <span id="lhCount" class="lh-n"></span></div>
+          <details class="pop" id="addMenu"><summary aria-label="Add a repo or a room" title="Add a repo or a room"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg></summary><div class="pop-body">
+            <button type="button" class="pop-item" data-act="add-dialog"><span>Repo…</span><small>Register a repository</small></button>
+            <button type="button" class="pop-item" data-act="room-dialog" title="Register a room: a repo where you coordinate a group of repos"><span>Room…</span><small>A repo that coordinates a group</small></button>
+          </div></details>
+          <label id="lhSearchBox" class="lh-search" hidden>
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>
+            <input id="lhSearch" type="search" placeholder="Filter repos…" aria-label="Filter repos" autocomplete="off">
+            <button type="button" class="lh-x" data-act="lh-search-close" aria-label="Close search">✕</button>
+          </label>
+          <div id="lhIcons" class="lh-icons">
+            <span id="lhLive"></span>
+            <button type="button" id="lhFilterBtn" class="lh-ic" data-act="lh-filters" aria-label="More filters" title="More filters" aria-expanded="false" aria-controls="lhMenu"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="8" cy="3" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="8" cy="13" r="1.4"/></svg><i id="lhDot" class="lh-dot" hidden></i></button>
+          </div>
+        </div>
+        <div id="lhMenu" class="lh-menu" role="group" aria-label="Filters" hidden>
+          <button type="button" class="lh-x lh-menu-x" data-act="lh-menu-close" aria-label="Close filters" title="Close">✕</button>
+          <div><h4>Scope</h4><div id="lhScope" class="rs-scope"></div></div>
+          <div><h4>Group</h4><select id="lhGroup" aria-label="Group"></select></div>
+          <button type="button" class="lh-mi" data-act="lh-search-open">Search…</button>
+          <button type="button" class="lh-mi" data-act="lh-clear">Clear filters</button>
+        </div>
+      </div>
+      <section id="summary" class="rs-panel" role="tabpanel" aria-labelledby="tab-summary"></section>
+    </div>
+    <div id="split" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Adjust the list width (left and right arrows; double click to reset)" hidden></div>
+    <aside id="chat" hidden aria-label="Chat">
+      <div id="chatHead" class="ch-head"></div>
+      <div id="chatBody" class="ch-body" role="log" aria-live="polite"></div>
+      <div id="composer" class="composer" role="group" aria-label="Message">
+        <div id="termBlock" class="term-block"></div>
+        <div id="quickRow" class="quick-slot"></div>
+        <div id="queueRow" class="queue-slot"></div>
+        <div class="msg-field">
+          <button id="msgExpand" class="msg-expand" type="button" data-act="msg-expand" aria-label="Expand the message box" aria-expanded="false" title="Expand the message box" hidden><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 2.5h4v4M13.5 2.5l-4.5 4.5M6.5 13.5h-4v-4M2.5 13.5l4.5-4.5"/></svg></button>
+          <textarea id="msgBox" rows="1" enterkeyhint="enter" aria-label="Message to the session" title="Enter sends · Shift+Enter new line"></textarea>
+        </div>
+        <div class="c-bar">
+          <div class="c-left"><div id="sessState" class="sess-state"></div></div>
+          <span id="chatActions" class="c-actions"></span>
+          <button id="msgStop" class="c-round c-stop" type="button" data-act="chat-stop" aria-label="Stop the run" title="Stop the run that is going on" hidden><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="2" fill="currentColor"/></svg></button>
+          <button id="msgQueue" class="c-queue" type="button" data-act="chat-queue" aria-label="Queue the message for when the run ends" title="Queue it for when the run ends (Alt+Enter)" hidden>Queue</button>
+          <button id="msgSteer" class="c-round c-send" type="button" data-act="chat-steer" aria-label="Correct the agent now" title="Correct the agent on the fly (Enter)" hidden><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V3M3.8 7.2L8 3l4.2 4.2"/></svg></button>
+          <button id="msgSend" class="c-round c-send" type="button" data-act="chat-send" aria-label="Send message"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V3M3.8 7.2L8 3l4.2 4.2"/></svg></button>
+        </div>
+        <div id="msgNote" class="rs-note" role="status"></div>
+      </div>
+    </aside>
+    <div id="split2" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Adjust the column width (left and right arrows; double click to reset)" hidden></div>
+    <aside id="col" hidden aria-label="Repo column">
+      <div id="colBody"></div>
+    </aside>
+  </div>
+  <div id="work" role="tabpanel" aria-label="Work" hidden>
+    <div id="queue" class="queue" hidden></div>
+    <main id="app"></main>
+  </div>
+
+  <section id="conformityView" class="rs-panel" role="tabpanel" aria-labelledby="tab-conformity" hidden></section>
+  <section id="settingsView" class="rs-panel" role="tabpanel" aria-labelledby="tab-settings" hidden></section>
+
+  <dialog id="addDialog">
+    <form method="dialog" id="addForm">
+      <h2>Add repositories</h2>
+      <label>Group
+        <input id="addGroup" list="groupList" placeholder="Personal, Work, Commercial…" required>
+        <datalist id="groupList"></datalist>
+      </label>
+      <label>Repository folder
+        <input id="addPath" placeholder="C:\Users\you\Developer\my-repo">
+      </label>
+      <div class="row">
+        <button type="button" data-act="add-one" class="primary">Add this repo</button>
+        <button type="button" data-act="scan">Scan folder for repos</button>
+      </div>
+      <div id="scanResults"></div>
+      <div class="row end">
+        <button type="button" data-act="add-selected" id="addSelected" hidden class="primary">Add selected</button>
+        <button type="button" data-act="close-dialog">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="roomDialog">
+    <form id="roomForm">
+      <h2>Add a room</h2>
+      <p class="muted">A room is a repo where you coordinate a group of repos. This only registers it in the panel: its folder is never changed.</p>
+      <label>Room name
+        <input id="roomName" maxlength="60" autocomplete="off" placeholder="UPEN, H2O, TOOLS…">
+      </label>
+      <label>Room folder
+        <input id="roomPath" list="roomPathList" autocomplete="off" placeholder="C:\Users\you\Developer\my-room">
+        <datalist id="roomPathList"></datalist>
+      </label>
+      <div id="roomError" class="form-error" role="alert" hidden></div>
+      <div class="row end">
+        <button type="submit" id="roomSubmit" class="primary">Add room</button>
+        <button type="button" data-act="close-room-dialog">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="mergeSheet" hidden></div>
+  <div id="toasts"></div>
+  <script src="/view.js"></script>
+  <script src="/highlight.js"></script>
+  <script src="/resumen.js"></script>
+  <script src="/notify.js"></script>
+  <script src="/data.js"></script>
+  <script src="/feed.js"></script>
+  <script src="/tabs.js"></script>
+  <script src="/chat.js"></script>
+  <script src="/board.js"></script>
+  <script src="/actions.js"></script>
+  <script src="/viewport.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
