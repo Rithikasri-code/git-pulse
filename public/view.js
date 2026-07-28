@@ -1,0 +1,1247 @@
+'use strict';
+// Pure helpers shared by the page (plain <script>, global RepoPanelView) and the server and tests
+// (CommonJS). No dependencies, no DOM.
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.RepoPanelView = api;
+}(typeof self !== 'undefined' ? self : this, () => {
+  // Bump it when the client starts needing a new or changed server route. /health reports the value
+  // the running server loaded at start; the page compares it with the file it just downloaded.
+  const API_VERSION = 16;
+
+  // `health` is the parsed /health answer, or null when the request itself failed (no answer, so
+  // there is nothing to warn about). Any answer without the current integer `api` is out of date:
+  // an old server does not send the field at all.
+  function isOutdated(health) {
+    if (health == null) return false;
+    return !(typeof health === 'object' && Number.isInteger(health.api) && health.api === API_VERSION);
+  }
+
+  // RP148: the tab the right column OPENS on, from the situation of the repo (the page decides once per opening, as soon as this stops answering null): uncommitted changes -> 'changes'; an open PR of the
+  // branch -> 'status'; a clean tree with nothing ahead to deliver -> 'tasks'; anything else -> 'changes'. null while what matters is not known yet: the files, or (with a clean tree) the answer of the PRs.
+  function columnTabFor(s) {
+    if (!isObject(s) || !Array.isArray(s.files)) return null;
+    if (s.files.length > 0) return 'changes';
+    if (s.prsKnown !== true) return null;
+    if (s.hasPr === true) return 'status';
+    return Number.isInteger(s.ahead) && s.ahead === 0 ? 'tasks' : 'changes';
+  }
+  // RP134 (S26): under NARROW_BELOW px of width of the layout the page shows ONE zone at a time: the list of repos, or the chat of the open repo. null from that width up, and for a width that is not a real size (a layout that is
+  // hidden in another tab measures 0): what is not known keeps today's behaviour. The page marks it with `data-screen` and the stylesheet follows the mark.
+  const NARROW_BELOW = 760;
+  // RP157: with a repo open and the zone `repo` (the address of RP133) the screen is `repo`, the column on top of the chat.
+  // RP136: from NARROW_BELOW to DUO_BELOW px (the `mid` band) the page shows TWO zones side by side, the chat and Repo (the column): `duo` with a repo open, `list` with none; the zone does not matter there. From DUO_BELOW up there is
+  // no screen (the three columns). bandOf says the band of a width, null for what is not a real size.
+  const DUO_BELOW = 1100;
+  function bandOf(width) {
+    if (typeof width !== 'number' || !Number.isFinite(width) || width <= 0) return null;
+    return width < NARROW_BELOW ? 'narrow' : width < DUO_BELOW ? 'mid' : 'wide';
+  }
+  function screenOf(width, chatId, zone) {
+    const band = bandOf(width);
+    if (!band || band === 'wide') return null;
+    if (!chatId) return 'list';
+    return band === 'mid' ? 'duo' : zone === 'repo' ? 'repo' : 'chat';
+  }
+  // RP133 (S26): the address of the page (its hash) as a CLOSED grammar. It is untrusted input (anyone can type or paste one), so only these forms count: the list (empty, `#`, `#/`), Conformity (`#conformity` exactly) and
+  // `#/repo/<id>/<zone>` with the zone optional when reading (then chat) and from a closed list. An id counts only when it is IN the list of repos the page has (an array), compared as exact text after a check of its characters
+  // (letters, digits, `_` and `-`, up to 64) and never one of the names of the machinery of the language. Nothing is decoded (a `%` is out), evaluated or drawn as markup. Pure and total: anything else answers null.
+  const ADDRESS_ZONES = ['chat', 'repo'];
+  const ADDRESS_MAX = 200;
+  const ADDRESS_ID = /^[A-Za-z0-9_-]{1,64}$/;
+  const ADDRESS_REPO = /^#\/repo\/([A-Za-z0-9_-]{1,64})(?:\/(chat|repo))?$/;
+  const ADDRESS_BANNED = new Set([...Object.getOwnPropertyNames(Object.prototype), 'prototype']);
+  function parseAddress(hash, ids) {
+    if (typeof hash !== 'string') return null;
+    if (hash === '' || hash === '#' || hash === '#/') return { kind: 'list' };
+    if (hash === '#conformity') return { kind: 'conformity' };
+    if (hash.length > ADDRESS_MAX) return null;
+    const m = ADDRESS_REPO.exec(hash);
+    if (!m || ADDRESS_BANNED.has(m[1]) || !Array.isArray(ids)) return null;
+    const id = ids.find((x) => x === m[1]); // the text of the LIST comes back, never the text of the address
+    return id === undefined ? null : { kind: 'repo', id, zone: m[2] || 'chat' };
+  }
+  // The address of a repo and a zone (always written), or '' when the id is not plain text that the grammar can carry (a room has `:` in its id, so it has none).
+  function addressOf(id, zone) {
+    if (typeof id !== 'string' || !ADDRESS_ID.test(id) || ADDRESS_BANNED.has(id)) return '';
+    return `#/repo/${id}/${ADDRESS_ZONES.includes(zone) ? zone : 'chat'}`;
+  }
+  // RP143: the Conformity tab is an icon with an aria-label, so the count has to be in the label to be read.
+  function conformityTabLabel(n) { return Number.isInteger(n) && n > 0 ? `Conformity: ${n} to review` : 'Conformity'; }
+  // Single place that decides what the conformity drawer says.
+  // conf = { loaded, failed, ok, items, req: { prereq, repos: [{ id, state, ready }], rooms?: { state, list: [{ name, ready }] } } }
+  // where prereq, each repo state and rooms.state are 'loading' | 'loaded' | 'failed'. Conformity is claimed
+  // only when the roadmap report came back empty AND the requirements of every repo and the prerequisites were
+  // loaded and ready AND every room was loaded and ready: never on data that is missing or unverified.
+  // `rooms` is absent for a page that has no rooms.
+  function conformityView(conf) {
+    if (conf.failed) return { state: 'error', summary: '', message: 'Could not compute the report (is the panel server out of date? restart it)', count: 0 };
+    if (!conf.loaded) return { state: 'computing', summary: '', message: 'Computing the report…', count: 0 };
+    const req = conf.req || { prereq: 'loading', repos: [] };
+    const repos = req.repos || [];
+    const rooms = req.rooms || { state: 'loaded', list: [] };
+    const roomsNotReady = rooms.state === 'loaded' ? rooms.list.filter((r) => !r.ready) : [];
+    const notReady = repos.filter((r) => r.state === 'loaded' && !r.ready);
+    const itemIds = new Set(conf.items.map((i) => i.id).filter((id) => id !== undefined));
+    const count = conf.items.length + notReady.filter((r) => !itemIds.has(r.id)).length + roomsNotReady.length;
+    if (count) {
+      const parts = [`${conf.ok} conform`];
+      if (conf.items.length) parts.push(`${conf.items.length} need attention`);
+      if (notReady.length) parts.push(`${notReady.length} not ready`);
+      if (roomsNotReady.length) parts.push(`${roomsNotReady.length} room${roomsNotReady.length === 1 ? '' : 's'} not ready`);
+      // RP213: the same counters as figures for the phone (the text above stays for desktop and assistive tools).
+      const figures = [{ n: conf.ok, word: 'conform' }];
+      if (conf.items.length) figures.push({ n: conf.items.length, word: 'attention' });
+      if (notReady.length) figures.push({ n: notReady.length, word: 'not ready' });
+      if (roomsNotReady.length) figures.push({ n: roomsNotReady.length, word: 'rooms' });
+      return { state: 'issues', summary: parts.join(' · '), figures, message: '', count };
+    }
+    if (req.prereq === 'failed' || repos.some((r) => r.state === 'failed') || rooms.state === 'failed') {
+      return { state: 'error', summary: '', message: 'Could not check the requirements (is the panel server out of date? restart it)', count: 0 };
+    }
+    if (req.prereq !== 'loaded' || repos.some((r) => r.state !== 'loaded') || rooms.state !== 'loaded') return { state: 'computing', summary: '', message: 'Computing the report…', count: 0 };
+    return { state: 'ok', summary: `${conf.ok} conform`, figures: [{ n: conf.ok, word: 'conform' }], message: 'All repositories conform.', count: 0 };
+  }
+
+  // RP213: a repo block of Conformity on the phone. `entry` is S.req[id] (absent = still loading); `choice` is what the person set (true open, false closed, undefined none) and wins.
+  // Without a choice a repo opens when it asks for attention (not ready, could not be read) or is still loading, the same reading as reqSummary (loaded and ready = conforms).
+  function reqFold(entry, choice) {
+    const ready = !!(entry && entry.state === 'loaded' && entry.data && entry.data.summary && entry.data.summary.ready);
+    let state = 'Checking…';
+    if (entry && entry.state !== 'loaded') state = 'Could not read';
+    else if (entry) {
+      const d = entry.data || {};
+      const pass = (d.results || []).filter((x) => x.status === 'pass').length;
+      const req = (d.summary && d.summary.required) || { pass: 0, total: 0 };
+      state = ready ? `Ready · ${pass} passing` : `Not ready · required ${req.pass}/${req.total}`;
+    }
+    return { open: typeof choice === 'boolean' ? choice : !ready, state };
+  }
+
+  // `entry` is the page's record of one repo's requirements: { state: 'loading' | 'loaded' | 'failed', data }.
+  // Nothing is claimed about a repo whose requirements are not loaded.
+  function openRequirements(entry) {
+    const results = entry && entry.state === 'loaded' && entry.data && Array.isArray(entry.data.results) ? entry.data.results : null;
+    return results && results.filter((r) => r.status !== 'pass');
+  }
+
+  // The compact card warning: only for a REQUIRED requirement that is not passing, and not hidden by the user.
+  function cardWarning(entry, dismissed) {
+    const open = openRequirements(entry);
+    const required = open ? open.filter((r) => r.level === 'required') : [];
+    if (!required.length || dismissed) return null;
+    return { count: required.length, ids: required.map((r) => r.id) };
+  }
+
+  // Items of the card's "more options" menu, as data-act names with their labels.
+  function cardMenu(entry, dismissed) {
+    const open = openRequirements(entry);
+    if (!open || !open.length) return [];
+    // A room is judged with the room requirements and never gets the member order.
+    const items = entry.data.isRoom ? [] : [{ act: 'put-in-conditions', label: 'Put in conditions' }];
+    if (open.some((r) => r.level === 'required')) items.push({ act: 'toggle-warning', label: dismissed ? 'Show warning' : 'Hide warning' });
+    return items;
+  }
+
+  // The room a repo belongs to, from the rooms of /api/config ({ name, path, repos: [repoId] }), or null.
+  function roomOfRepo(rooms, id) {
+    return (Array.isArray(rooms) ? rooms : []).find((r) => r && Array.isArray(r.repos) && r.repos.includes(id)) || null;
+  }
+
+  // The "Assign to room" group of the card menu, from the rooms of /api/config: { title, items }. Each item is
+  // { act, label, current, room? }; `room` is the room name, or null for "No room". With no rooms there is no group
+  // (empty title) and the only item offers to create one.
+  function roomMenu(rooms, id) {
+    const list = (Array.isArray(rooms) ? rooms : []).filter((r) => r && typeof r.name === 'string');
+    if (!list.length) return { title: '', items: [{ act: 'room-dialog', label: 'Create a room…', current: false }] };
+    const mine = roomOfRepo(list, id);
+    return {
+      title: 'Assign to room',
+      items: [
+        ...list.map((r) => ({ act: 'assign-room', room: r.name, label: r.name, current: r === mine })),
+        { act: 'assign-room', room: null, label: 'No room', current: !mine },
+      ],
+    };
+  }
+
+  // The warning for `roomIssues` of /api/config (config.json entries under rooms that the panel ignores), or null.
+  // RP218: the folder of a room is the room itself, not a project: Conformity asks it no roadmap and does not count its requirements twice. `rooms` is the list of /api/rooms (each with the `id` of its folder, or null).
+  function projectRepos(repos, rooms) {
+    const folders = new Set((Array.isArray(rooms) ? rooms : []).map((m) => (m && typeof m === 'object' ? m.id : null)).filter((id) => typeof id === 'string' && id));
+    return (Array.isArray(repos) ? repos : []).filter((r) => !folders.has(r.id));
+  }
+
+  // RP220: the room whose folder is the repo with this id (the one open in the chat), or null. `rooms` is the list of /api/rooms (each with the `id` of its folder, or null). Total.
+  function roomOfFolder(rooms, id) {
+    if (!Array.isArray(rooms) || typeof id !== 'string' || !id) return null;
+    return rooms.find((m) => isObject(m) && m.id === id) || null;
+  }
+  // RP220: the tab of the right column that is open, from the one the person has (`tab`) and where the page is (`o.room`: the folder of a room, `o.phone`: under 760 px, where Notes is a tab of the
+  // column). A room opens on Projects (the id of the tab is `members`), keeps it, Status, Files and Changes, and has no Tasks (a room carries no roadmap); a repo that is not a room reads as it always did: Tasks, Status, Files,
+  // Notes (only on a phone) and anything else is Changes. Total.
+  function columnTabOf(tab, o) {
+    const x = isObject(o) ? o : {};
+    const notes = x.phone === true && tab === 'notes';
+    if (x.room === true) return !tab ? 'members' : ['members', 'status', 'files'].includes(tab) || notes ? tab : 'changes';
+    return ['tasks', 'status', 'files'].includes(tab) || notes ? tab : 'changes';
+  }
+  // RP220 (A27): the rooms the page shows. The card of a room, its chat and its Projects tab must not wait for GET /api/rooms (it runs git: tens of seconds, and the page gives up at 25 s), so
+  // the room is built from what the page already has: `configRooms` (S.rooms, from /api/config: name, path, members) and `repos` (id, path, name, to find the id of the folder of the room). `dataRooms`
+  // (the `rooms` of /api/rooms, or null) only COMPLETES it (id, last commit, requirements). One entry per configured room, in its order, then the rooms that only the data has. Pure and total.
+  function mergeRooms(configRooms, repos, dataRooms) {
+    const list = (a) => (Array.isArray(a) ? a : []);
+    const norm = (p) => String(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase(); // like the server: slashes, trailing slashes and case do not matter
+    const known = list(repos).filter((r) => isObject(r) && typeof r.id === 'string' && r.id && typeof r.path === 'string');
+    const data = list(dataRooms).filter((m) => isObject(m) && typeof m.name === 'string');
+    const folderId = (p) => { if (typeof p !== 'string' || !p) return null; const want = norm(p); const hit = known.find((r) => norm(r.path) === want); return hit ? hit.id : null; };
+    const out = list(configRooms).filter((c) => isObject(c) && typeof c.name === 'string').map((c) => {
+      const d = data.find((m) => m.name === c.name) || {};
+      const path = typeof c.path === 'string' ? c.path : d.path;
+      const members = Array.isArray(c.repos) ? c.repos : d.repos;
+      return { ...d, name: c.name, path, repos: Array.isArray(members) ? members : [], id: typeof d.id === 'string' && d.id ? d.id : folderId(path) };
+    });
+    const have = new Set(out.map((m) => m.name));
+    for (const d of data) if (!have.has(d.name)) out.push({ ...d });
+    return out;
+  }
+  // RP220: what the Projects tab of a room shows for each member id, in the order of the room, from what the page already has: `repos` (id and name), `rows` (the rows of the summary) and the
+  // getters `prsFor(id)` and `liveFor(id)` (a getter that throws is no data). A member that is not a repo of the panel stays in the list with `known: false`. Total.
+  function roomMembers(room, d) {
+    const ids = isObject(room) && Array.isArray(room.repos) ? room.repos.filter((id) => typeof id === 'string' && id) : [];
+    const x = isObject(d) ? d : {};
+    const repos = Array.isArray(x.repos) ? x.repos : [];
+    const rows = Array.isArray(x.rows) ? x.rows : [];
+    const ask = (fn, id) => { try { return typeof fn === 'function' ? fn(id) : undefined; } catch { return undefined; } };
+    return ids.map((id) => {
+      const repo = repos.find((r) => isObject(r) && r.id === id);
+      const row = rows.find((r) => isObject(r) && r.id === id);
+      const last = row && isObject(row.lastMovement) ? row.lastMovement : {};
+      const prs = ask(x.prsFor, id);
+      const end = row && isObject(row.session) && isObject(row.session.last) ? row.session.last : null; // RP228: how its last task ended, only a well-formed one
+      const done = end && ['done', 'failed', 'stopped'].includes(end.kind) && typeof end.at === 'string' ? { last: { kind: end.kind, at: end.at } } : {};
+      return { id, ...done, name: repo && typeof repo.name === 'string' ? repo.name : id, known: !!repo, state: row && isObject(row.session) ? row.session.state : undefined, at: typeof last.at === 'string' ? last.at : null, what: typeof last.what === 'string' ? last.what : '', prs: prs === undefined ? null : prs, live: ask(x.liveFor, id) };
+    });
+  }
+
+  function roomIssuesNotice(issues) {
+    const reasons = (Array.isArray(issues) ? issues : []).filter((s) => typeof s === 'string' && s);
+    if (!reasons.length) return null;
+    const n = reasons.length;
+    const message = reasons.every((s) => s.startsWith('rooms['))
+      ? `${n} entr${n === 1 ? 'y' : 'ies'} in config.json under rooms ${n === 1 ? 'is' : 'are'} invalid and ignored`
+      : 'rooms in config.json is not a list and is ignored';
+    return { message, reasons };
+  }
+
+  // The card's room tag: { name, dot, title }, or null for a repo that is not in a room. `entry` is the page's record
+  // of /api/rooms: { state: 'loading' | 'loaded' | 'failed', data: { rooms } }; nothing is claimed until it loaded.
+  function roomTag(rooms, id, entry) {
+    const room = roomOfRepo(rooms, id);
+    if (!room) return null;
+    const list = entry && entry.state === 'loaded' && entry.data && Array.isArray(entry.data.rooms) ? entry.data.rooms : null;
+    const live = list && list.find((r) => r.name === room.name);
+    if (!live) return { name: room.name, dot: 'gray', title: `Room ${room.name} · ${entry && entry.state === 'failed' ? 'could not read the room state' : 'checking the room…'}` };
+    const last = typeof live.lastCommit === 'string' && live.lastCommit ? live.lastCommit.slice(0, 10) : 'unknown';
+    return { name: room.name, dot: 'gray', title: `Room ${room.name} · last commit ${last}` };
+  }
+
+  // The state an agent declared (the answer of /api/state), or null when it cannot be relied on: not available
+  // (missing, invalid, unsafe, error), unknown state, or older than the repo's last activity (stale).
+  const STATE_DOT = { working: 'yellow', 'needs-input': 'blue', 'ready-to-commit': 'green', 'ready-to-pr': 'green', blocked: 'red' };
+
+  // A declared `working` older than this (by its own `at`) is treated as expired: an agent that crashed would
+  // otherwise hide the commit button forever. needs-input, blocked and ready-to-pr never expire by time.
+  const WORKING_EXPIRY_MS = 30 * 60 * 1000;
+
+  function expiredWorking(data, now) {
+    const at = Date.parse(data.at);
+    return data.state === 'working' && Number.isFinite(at) && now - at > WORKING_EXPIRY_MS;
+  }
+
+  // A declared `working` is not invalidated by repo activity (`stale`): the agent is meant to be changing files
+  // while it works, so only its own expiry ends it. Every other state is ignored once the repo changed after it.
+  function usableState(data, now = Date.now()) {
+    if (!data || data.available !== true || (data.stale === true && data.state !== 'working')) return null;
+    if (!Object.hasOwn(STATE_DOT, data.state)) return null;
+    return expiredWorking(data, now) ? null : data;
+  }
+
+  // Why the commit buttons are disabled while the work is still going on, or null. `session` is the state of
+  // the RPC host for a repo with changes: busy and asking hold; idle, closed, unknown and no state never do (fail open).
+  const SESSION_BUSY = 'the session is still working';
+  const SESSION_ASKING = 'waiting for your answer in the session';
+  const QUIET_MS = 20 * 1000; // files changed more recently than this: more changes are probably coming
+  const QUIET_SKEW_MS = 5 * 1000; // a time further in the future than this is a clock problem, not activity
+  const QUIET_REASON = 'files changed a few seconds ago';
+
+  function sessionHold(session) {
+    return session === 'busy' ? SESSION_BUSY : session === 'asking' ? SESSION_ASKING : null;
+  }
+  // RP163: the reason the delivery buttons are held while the session waits for background jobs (the server counts them, RP161, and leaves the number in the row of the Summary): only a positive safe integer holds, and at
+  // most 99 are said. Total.
+  function jobsHold(n) {
+    return Number.isSafeInteger(n) && n > 0 ? `${Math.min(n, 99)} background job${n === 1 ? ' is' : 's are'} running` : '';
+  }
+  // RP159: the ONE rule that holds a delivery button (/flow-ship, /flow-pr, /flow-base, /flow-next, Fix CI): the reason it is held, or ''. In this order: the order is on its way (`sending`, a command name), a command sent
+  // from this page is judged running (`running`, { cmd, label }), the session asks you or works (`session`, the LIVE state: busy | asking). What is not exactly one of those holds nothing. Total.
+  function deliveryHold(ctx) {
+    const c = ctx && typeof ctx === 'object' && !Array.isArray(ctx) ? ctx : {};
+    if (typeof c.sending === 'string' && c.sending) return 'Sending the order to the session';
+    const run = c.running;
+    if (run && typeof run === 'object' && typeof run.cmd === 'string' && typeof run.label === 'string') return runningReason(run);
+    if (c.session === 'asking') return 'The session is waiting for your answer';
+    if (c.session === 'busy') return 'The session is working: wait for it to finish';
+    return jobsHold(c.jobs); // RP163: free, but it waits for background jobs
+  }
+
+  // Whether the newest changed file is younger than QUIET_MS. A missing or non-finite value never blocks.
+  function quietPeriod(lastChangeMs, now = Date.now()) {
+    if (typeof lastChangeMs !== 'number' || !Number.isFinite(lastChangeMs)) return false;
+    const age = now - lastChangeMs;
+    return age >= -QUIET_SKEW_MS && age < QUIET_MS;
+  }
+
+  // True while any repo has a request in flight: the one place the page shows that it is refreshing (the top button).
+  const isRefreshing = (loading) => Object.values(loading || {}).some((n) => n > 0);
+
+  // Refresh rhythm (S22). Git data (no network) is re-read every LOCAL_REFRESH_MS; GitHub data of every repo every
+  // FULL_REFRESH_MS; a "hot" repo also re-reads its PRs every HOT_REFRESH_MS, so a merge shows up fast without every repo
+  // spending the API budget of 5000 requests per hour.
+  const LOCAL_REFRESH_MS = 10000;
+  const HOT_REFRESH_MS = 20000;
+  const FULL_REFRESH_MS = 60000;
+
+  // Hot: the current branch has an open PR (the PR is the thing about to change), or a command of the panel is in flight.
+  function isHotRepo({ local, prs, sent } = {}) {
+    if (sent) return true;
+    const branch = local && !local.error && !local.detached ? local.branch : null;
+    return !!branch && Array.isArray(prs && prs.prs) && prs.prs.some((p) => p.head === branch);
+  }
+
+  // How often a repo with a command of the panel in flight asks for the live session state, to notice the finish fast.
+  const SENT_POLL_MS = 3000;
+
+  // What the periodic tick refreshes now: [{ id, kind }], kind 'sent' (the session state of a command in flight), 'hot'
+  // (local + PRs) or 'local' (git only); one entry per repo, 'sent' first. `last[id]` is { local, prs, pistatus }: when each
+  // kind of data was last asked for (a full refresh sets local and prs). Nothing while the tab is hidden; a repo with a
+  // request in flight, or a busy key '<id>:<n>' with value true (a merge or re-run of that repo), is skipped.
+  function refreshPlan({ now = Date.now(), ids = [], local = {}, prs = {}, sent = {}, last = {}, loading = {}, hidden = false, busy = {} } = {}) {
+    if (hidden) return [];
+    const paused = new Set(Object.keys(busy).filter((k) => busy[k] === true).map((k) => k.slice(0, k.lastIndexOf(':'))));
+    const out = [];
+    for (const id of ids) {
+      if (loading[id] > 0 || paused.has(id)) continue;
+      const at = last[id] || {};
+      if (sent[id] && now - (at.pistatus || 0) >= SENT_POLL_MS) out.push({ id, kind: 'sent' });
+      else if (isHotRepo({ local: local[id], prs: prs[id], sent: sent[id] }) && now - (at.prs || 0) >= HOT_REFRESH_MS) out.push({ id, kind: 'hot' });
+      else if (now - (at.local || 0) >= LOCAL_REFRESH_MS) out.push({ id, kind: 'local' });
+    }
+    return out;
+  }
+
+  // The repos the quiet-period tick watches: loaded, with uncommitted changes, and no command of the panel in flight
+  // (loadPiStatus already polls those). Nothing while the tab is hidden.
+  function dirtyRepos({ ids = [], local = {}, sent = {}, hidden = false } = {}) {
+    if (hidden) return [];
+    return ids.filter((id) => hasLocal(local[id]) && local[id].files.length > 0 && !sent[id]);
+  }
+
+  // The commit button stays unless a usable state says the work is not ready to commit. No state never blocks.
+  // `override` is the page's "Show /flow-ship anyway" choice for this repo.
+  function commitAllowed(data, { now = Date.now(), override = false } = {}) {
+    if (override) return true;
+    const s = usableState(data, now);
+    return !s || s.state === 'ready-to-commit';
+  }
+
+  // The "⋯" menu item that lifts the state gating, only while the gating hides the button and it is not lifted yet.
+  // Never on a stale repo with changes: that card offers /flow-base --stash, so /flow-ship would not appear anyway.
+  // `session` is the live pi session state: a busy or asking one also gates the button, and the item lifts that too.
+  function commitOverrideItem(data, { now = Date.now(), override = false, stale = false, session, jobs } = {}) {
+    return !override && !stale && (!commitAllowed(data, { now }) || sessionHold(session) || jobsHold(jobs)) ? { act: 'show-commit', label: 'Show /flow-ship anyway' } : null;
+  }
+
+  // The card's "what to do now" line: { kind: 'current', dot, text, title } for a usable state, { kind: 'outdated',
+  // dot: 'gray', text: '', title } for a stale one (only a marker: the old text is never shown as current), else null.
+  function stateLine(data, { now = Date.now() } = {}) {
+    const s = usableState(data, now);
+    if (s) return { kind: 'current', dot: STATE_DOT[s.state], text: s.next, title: [s.next, s.detail, s.at].filter(Boolean).join('\n\n') };
+    if (data && data.available === true && Object.hasOwn(STATE_DOT, data.state)) {
+      if (data.stale === true) return { kind: 'outdated', dot: 'gray', text: '', title: 'Declared state is outdated (the repo changed after it was written); ignored' };
+      return { kind: 'outdated', dot: 'gray', text: '', title: 'Declared "working" state is older than 30 minutes; ignored' };
+    }
+    return null;
+  }
+
+  // RP94b2: whether the card leaves its status line out. Only when it would repeat the roadmap block: the declared state is `working` (the roadmap already says it is in
+  // progress) or outdated (it was only a gray marker), AND the card shows a roadmap block. needs-input, blocked, ready-to-commit and ready-to-pr always stay: they say
+  // something the roadmap does not and ask something of the person. Total.
+  function stateLineHidden(data, line, hasRoadmap) {
+    if (!hasRoadmap || !isObject(line)) return false;
+    return line.kind === 'outdated' || (isObject(data) && data.state === 'working');
+  }
+
+  const hasLocal = (l) => !!l && typeof l === 'object' && !l.error && Array.isArray(l.files);
+
+  // A reason the repo needs a person's hands, or null. Commits on the base branch are forbidden outside
+  // /flow-ship, and anything done by hand that the panel cannot drive is flagged. A clean branch that is only
+  // behind, a base with nothing ahead and a task branch with commits ahead are all normal.
+  function manualAction(local, baseName) {
+    if (!hasLocal(local)) return null;
+    if (local.inProgress) return `A ${local.inProgress} is in progress: finish or abort it`;
+    if (local.detached) return 'Detached HEAD: switch to a task branch';
+    if (baseName && local.branch === baseName && local.ahead > 0) return `Commits on ${baseName}: move them to a task branch`;
+    if (local.ahead > 0 && local.behind > 0) return `Diverged from ${local.upstream || 'its upstream'}: reconcile it by hand`;
+    return null;
+  }
+
+  // The optional facts the "Go work on" strip sends for a repo, so it never says "Deliver changes" for work that
+  // must not be delivered: `manual` (why the repo needs a person's hands: manualAction, else the reason of an
+  // attention verdict) and `waiting` ({ state, next } of a usable needs-input or blocked declared state, not when
+  // the person lifted the gating with `override`). Keys are absent when they do not apply.
+  // RP138: the open pull requests that BELONG to a unit of the roadmap: its id is a whole token of the title or of the head branch (the rule deriveUnitStates uses for "En revisión"). Only those hold the
+  // start of another unit back; the one release-please keeps open, or a bot's, is nobody's task. With no usable roadmap (no rows, or not an array) every pull request counts, as before.
+  // Total: always a new array, and a malformed entry is skipped.
+  // True when `id` appears in `text` as a complete token, case-insensitive. Letters and digits are
+  // token characters; a "." followed by one is too, so "p2" does not match "p2.1-x".
+  function matchesUnitId(text, id) {
+    if (!text || !id) return false;
+    const t = String(text).toLowerCase();
+    const needle = String(id).toLowerCase();
+    const alnum = (c) => c !== undefined && /[\p{L}\p{N}]/u.test(c);
+    const joins = (c, other) => alnum(c) || (c === '.' && alnum(other));
+    for (let i = t.indexOf(needle); i !== -1; i = t.indexOf(needle, i + 1)) {
+      const end = i + needle.length;
+      if (!joins(t[i - 1], t[i - 2]) && !joins(t[end], t[end + 1])) return true;
+    }
+    return false;
+  }
+  // RP173: the pull request of the CURRENT local branch is this checkout's own work in review, even when its row is not in the base roadmap yet (the row is born in the same diff as its work). Whole head, exact, case-sensitive.
+  function taskPrs(prs, rows, opts) {
+    const branch = opts && typeof opts.branch === 'string' ? opts.branch : '';
+    const list = Array.isArray(prs) ? prs.filter((p) => isObject(p)) : [];
+    const ids = Array.isArray(rows) ? [...new Set(rows.filter((r) => isObject(r) && typeof r.id === 'string' && r.id).map((r) => r.id))] : [];
+    if (!ids.length) return list;
+    return list.filter((p) => (branch && p.head === branch) || ids.some((id) => matchesUnitId(p.title, id) || matchesUnitId(p.head, id)));
+  }
+  function queueFlags(local, stateData, verdict, { now = Date.now(), override = false } = {}) {
+    const out = {};
+    const manual = manualAction(local, local && local.base) || (verdict && verdict.state === 'attention' ? verdict.reason : null);
+    if (manual) out.manual = manual;
+    const s = override ? null : usableState(stateData, now);
+    if (s && (s.state === 'needs-input' || s.state === 'blocked')) out.waiting = { state: s.state, next: typeof s.next === 'string' ? s.next : '' };
+    if (verdict && verdict.asking === true) out.waiting = { state: 'needs-input', next: 'Answer the question in the session' };
+    return out;
+  }
+
+  // Whether the COMMITTED card offers /flow-pr. `verdict` is the state of commitVerdict ('running' | 'ok' |
+  // 'attention' | null). /flow-pr creates the PR or updates the open one, so `update` only changes the label.
+  function prAction(local, prInfo, verdict) {
+    const no = (reason) => ({ show: false, update: false, reason });
+    if (!hasLocal(local)) return no('Local state not loaded');
+    const manual = manualAction(local, local.base);
+    if (manual) return no(manual);
+    if (local.files.length > 0) return no('Uncommitted changes: run /flow-ship first');
+    if (!(local.ahead > 0)) return no('No commits to deliver');
+    if (prInfo && prInfo.stale) return no('Branch already merged: run /flow-base');
+    if (verdict === 'attention') return no('Needs attention after /flow-ship');
+    if (verdict === 'running') return no('Committing…');
+    const open = prInfo && Array.isArray(prInfo.prs) ? prInfo.prs : [];
+    return { show: true, update: open.some((p) => p && p.head === local.branch), reason: null };
+  }
+
+  const FLOW_BASE_HINT = 'Start from a fresh, updated base branch: this branch was already merged';
+  const FLOW_STASH_HINT = 'This branch was already merged but has uncommitted changes. /flow-base --stash carries them to the fresh base branch (stash, switch, update, restore). It refuses and changes nothing when the work of this branch is not yet merged or its remote branch not yet deleted.';
+
+  const UNSTAGE_HINT = '/flow-ship needs an empty index. This clears the index (git reset: your changes stay in the working tree) and continues with the normal commit.';
+
+  // What a running command is called in a tooltip.
+  const RUNNING_NAME = { 'fix-pr': 'the fix order', 'put-in-conditions': 'the put-in-conditions order' };
+
+  // The tooltip of a button that is disabled while `running` ({ cmd, label }) runs.
+  function runningReason(running) {
+    const name = RUNNING_NAME[running.cmd] || CMD_TEXT[running.cmd] || `/${running.cmd}`;
+    return `Running ${name} (${running.label}): wait for it to finish`;
+  }
+
+  // RP129: the Merge button of a pull request, ONE rule for the card of the board and the footer of the right column. The server is the real guard (mergePr reads the PR again and refuses one that is
+  // not open or not ready); this is what the page OFFERS. It is enabled only for a ready PR with nothing in flight (`busy`: true or 'done'), nothing held after a merge (`held`) and no command
+  // running in the session (`hold`: the reason, from runningReason). Without a PR it is off and says why (`noPr`, or the default). Total: anything that is not a PR object is no PR.
+  const MERGE_METHODS = ['squash', 'merge', 'rebase'];
+  function mergeButton(pr, ctx = {}) {
+    const c = ctx && typeof ctx === 'object' ? ctx : {};
+    const method = MERGE_METHODS.includes(c.method) ? c.method : 'squash';
+    const word = `Merge · ${method}`;
+    const hint = (why) => `${/[.…!?]$/.test(why) ? why : `${why}.`} Method: ${method}. Change it in Settings, Delivery.`; // RP147: the Merge menu left the header, so the title says where the method lives
+    if (!pr || typeof pr !== 'object' || Array.isArray(pr) || typeof pr.ready !== 'boolean') return { enabled: false, label: word, title: hint(String(c.noPr || 'No open pull request for this branch')) };
+    const hold = c.hold ? String(c.hold) : '';
+    return {
+      enabled: pr.ready === true && !c.busy && !c.held && !hold,
+      label: c.held || c.busy === 'done' ? 'Merged ✓' : c.busy ? 'Merging…' : word,
+      title: hold || hint(pr.ready ? `Merge into ${pr.base}` : pr.blockedReason || 'Not ready to merge'),
+    };
+  }
+  // RP151: should the Tasks tab of the column read the roadmap again by itself? Only when a whole minute has gone since the last try, the repo is open, the column is ON SCREEN with its Tasks tab, the page is visible,
+  // no read is on its way (that one answers) and, on a phone, the Repo screen is the one showing. `at` is the time of the last TRY (a failed one counts, so a server that fails is not hammered). Total.
+  const TASKS_REFRESH_MS = 60000;
+  function tasksPollDue(ctx) {
+    const c = ctx && typeof ctx === 'object' && !Array.isArray(ctx) ? ctx : {};
+    if (typeof c.chatId !== 'string' || !c.chatId || c.column !== true || c.colTab !== 'tasks' || c.hidden === true || c.reading === true) return false;
+    if (c.narrow === true && c.zone !== 'repo') return false;
+    if (!Number.isFinite(c.at) || c.at < 0 || !Number.isFinite(c.now)) return false;
+    return c.now - c.at >= TASKS_REFRESH_MS;
+  }
+  // RP137: the reason a Merge button is off, to write it where there is no tooltip (a phone). Only for a button that is off with the plain label: a merging or merged one is not "off for a reason". Total.
+  function mergeWhy(btn) {
+    const b = btn && typeof btn === 'object' && !Array.isArray(btn) ? btn : {};
+    return b.enabled === false && typeof b.label === 'string' && b.label.startsWith('Merge ·') && typeof b.title === 'string' ? b.title : '';
+  }
+  // RP191 (S22): the reason of the PR itself («Not ready to merge», the checks…), short, for the placeholder of the message field. `held` is truthy when the reason is a hold (the session or a command is busy): that one
+  // is shown nowhere. Only a button that is off with the plain label has one; the tail (Method…) goes, the final period goes, and a one-row field clips a placeholder without an ellipsis, so it is clipped here to 60. Total.
+  function mergeNote(btn, held) {
+    const why = held ? '' : mergeWhy(btn).replace(/ Method:[\s\S]*$/, '').trim().replace(/\.$/, '').trim();
+    return why.length > 60 ? `${why.slice(0, 59)}…` : why;
+  }
+  // The Re-run failed button, with the same rule of flight, hold and running: shown only when the PR has failed runs.
+  function rerunButton(pr, ctx = {}) {
+    const runs = pr && typeof pr === 'object' && pr.checks && Array.isArray(pr.checks.failedRuns) ? pr.checks.failedRuns : [];
+    if (!runs.length) return { show: false, enabled: false, title: '' };
+    const c = ctx && typeof ctx === 'object' ? ctx : {};
+    const hold = c.hold ? String(c.hold) : '';
+    return { show: true, enabled: !c.busy && !c.held && !hold, title: hold };
+  }
+
+  // The flow buttons of a repo's LOCAL card, in order: [{ cmd, label, reason?, disabled? }] with cmd flow-ship |
+  // flow-ship-unstage | flow-pr | flow-base | flow-base-stash, or []. The one source of truth for the page and the
+  // tests. `ctx` is { override (the person lifted the declared-state gating of /flow-ship), verdict ('running' |
+  // 'ok' | 'attention' | null, the last /flow-ship), running ({ cmd, label } of a command sent from this page that is
+  // still running: the same buttons come back disabled with a reason), retry (label the commit button "Retry …"), session
+  // (live pi session state of a repo with changes: busy or asking disables the commit pair with a reason; so does a
+  // `local.lastChangeMs` younger than QUIET_MS; `override` lifts both), now }.
+  // A stale repo with changed or untracked files offers /flow-base --stash instead of /flow-ship (the skill carries
+  // the changes aside, updates the base branch and brings them back). A dirty repo with staged files offers
+  // /flow-ship --unstage instead of /flow-ship (the index must be empty). Neither branch button shows while a
+  // bare `verdict: 'running'` is passed or when the repo needs manual action.
+  function flowButtons(local, prInfo, stateData, ctx = {}) {
+    // RP233: `missing` holds the keys whose command the live session did not load: their button is off with that reason, whatever else holds it.
+    if (Array.isArray(ctx.missing) && ctx.missing.length) {
+      const { missing, ...rest } = ctx;
+      return flowButtons(local, prInfo, stateData, rest).map((b) => (missing.includes(b.cmd) ? { ...b, disabled: true, reason: notLoaded(b.cmd) } : b));
+    }
+    if (ctx.running) {
+      const { running, ...rest } = ctx;
+      const reason = runningReason(running);
+      return flowButtons(local, prInfo, stateData, { ...rest, verdict: null }).map((b) => ({ ...b, disabled: true, reason }));
+    }
+    if (!hasLocal(local) || manualAction(local, local.base)) return [];
+    const { override = false, verdict = null, retry = false, now = Date.now() } = ctx;
+    // RP159: the other delivery buttons follow the live session too (only /flow-ship did): held while it works or asks, with the reason of the session. The override of the person is for /flow-ship only.
+    const live = sessionHold(ctx.session) || jobsHold(ctx.jobs); // RP163
+    const held = live ? { disabled: true, reason: live } : {};
+    if (local.files.length > 0 && prInfo && prInfo.stale) return verdict === 'running' ? [] : [{ cmd: 'flow-base-stash', label: '/flow-base --stash', reason: FLOW_STASH_HINT, ...held }];
+    if (local.files.length > 0) {
+      if (!commitAllowed(stateData, { now, override })) return [];
+      const again = retry ? 'Retry ' : '';
+      const hold = override ? null : sessionHold(ctx.session) || jobsHold(ctx.jobs) || (quietPeriod(local.lastChangeMs, now) ? QUIET_REASON : null);
+      if (local.stagedCount > 0) return [{ cmd: 'flow-ship-unstage', label: `${again}/flow-ship --unstage`, reason: hold || UNSTAGE_HINT, ...(hold ? { disabled: true } : {}) }];
+      return [{ cmd: 'flow-ship', label: `${again}/flow-ship`, ...(hold ? { disabled: true, reason: hold } : {}) }];
+    }
+    const pa = local.ahead > 0 ? prAction(local, prInfo, verdict) : null;
+    if (pa && pa.show) return [{ cmd: 'flow-pr', label: pa.update ? '/flow-pr (update PR)' : '/flow-pr', ...held }];
+    if (prInfo && prInfo.stale && verdict !== 'running') return [{ cmd: 'flow-base', label: '/flow-base', reason: FLOW_BASE_HINT, ...held }];
+    return [];
+  }
+
+  // Tooltip of the red stale chip: names the button the card really offers. `stale` is { via, pr }; `dirty` is whether the
+  // repo has changed or untracked files (then the button is /flow-base --stash, which carries them).
+  function staleChipTitle(stale, dirty) {
+    const why = stale && stale.via === 'merged' ? `PR #${stale.pr} from this branch was merged.` : 'The remote branch was deleted, so its work was merged.';
+    if (dirty) return `${why} Press the /flow-base --stash button: it carries your uncommitted changes to a fresh, updated base branch.`;
+    return `${why} Press the /flow-base button to start from a fresh, updated base branch.`;
+  }
+
+  // Whether a PR card offers "Fix CI": only when its checks failed (even with no GitHub Actions run to re-run).
+  function fixPrAction(pr) {
+    if (pr && pr.checks && pr.checks.state === 'failed') return { show: true, reason: null };
+    return { show: false, reason: 'The checks have not failed' };
+  }
+
+  // Where a repo's LOCAL card goes, by Git state alone: { column, attn, row }. `column` is changes | committed | clean, or
+  // null when the repo has no local card (clean, nothing stale, only its PR cards); `row` is the compact clean row;
+  // `attn` marks a card that needs a person (error, stale branch, manual action, failed /flow-ship). `verdict` is
+  // the state of the last /flow-ship and `prCount` the number of open PRs of the repo.
+  function localPlacement(local, prInfo, prCount, verdict) {
+    const l = local || {};
+    if (l.error) return { column: 'changes', attn: true, row: false };
+    const attn = !!(prInfo && prInfo.stale) || !!manualAction(l, l.base) || verdict === 'attention';
+    if ((l.files || []).length > 0) return { column: 'changes', attn, row: false };
+    if ((l.ahead || 0) > 0) return { column: 'committed', attn, row: false };
+    if (attn) return { column: 'clean', attn: true, row: false };
+    if (!prCount) return { column: 'clean', attn: false, row: true };
+    return { column: null, attn: false, row: false };
+  }
+
+  // Where a repo's LOCAL card goes on the board: { column, attn, row }, built on localPlacement. `column` is attention |
+  // changes | committed | merged | idle | clean, or null (no local card). A stale branch with a clean tree and nothing ahead
+  // goes to `merged`; a card that needs a person for another reason goes to `attention`, so it is never hidden in the
+  // collapsed Idle bar; a quiet repo is an `idle` row. With `cleanAsColumn` the old Clean column holds the rows and the
+  // attention cards instead (and there is no `attention` or `idle` place).
+  function boardPlacement(local, prInfo, prCount, verdict, cleanAsColumn = false) {
+    const place = localPlacement(local, prInfo, prCount, verdict);
+    if (place.column !== 'clean') return place;
+    if (prInfo && prInfo.stale && place.attn) return { column: 'merged', attn: true, row: false };
+    if (cleanAsColumn) return place;
+    return place.attn ? { column: 'attention', attn: true, row: false } : { column: 'idle', attn: false, row: true };
+  }
+
+  // The board's columns left to right. Needs attention exists only while it has cards (`attentionCount`); Clean only
+  // when the person asked for it as a column.
+  function boardColumns(cleanAsColumn = false, attentionCount = 0) {
+    const first = cleanAsColumn ? ['clean'] : attentionCount > 0 ? ['attention'] : [];
+    return [...first, 'changes', 'committed', 'prs', 'merged'];
+  }
+
+  // A PR that cannot merge because of something the user must fix.
+  const isProblem = (pr) => !pr.ready && (pr.checks.state === 'failed' || ['DIRTY', 'BEHIND'].includes(pr.mergeStateStatus));
+
+  // The rank of a PR (the board shows all of them in the one `prs` column; the work queue relies on this).
+  const prColumn = (pr) => (pr.ready ? 'ready' : 'progress');
+
+  // The order inside the Pull requests column: 0 ready to merge, 1 problems (red), 2 the rest (checks running, waiting).
+  const prRank = (pr) => (pr.ready ? 0 : isProblem(pr) ? 1 : 2);
+
+  // The cards of the column in that order, keeping the original order inside each group; `get` reads the PR of an item.
+  const sortPrCards = (items, get = (x) => x) => items.map((item, i) => ({ item, i, rank: prRank(get(item)) }))
+    .sort((a, b) => a.rank - b.rank || a.i - b.i).map((x) => x.item);
+
+  // Verdict after /flow-ship (or the old /flow-commit, still judged when its record has `cmd`): { state: 'running' | 'ok' | 'attention', reason }, or null without a record.
+  // `sent` is { at (epoch ms), head, files, cmd? } recorded when the command was sent; `session` is the state of
+  // GET /api/pi-status (busy | idle | closed | ambiguous | unknown, or undefined before the first answer).
+  // ok/attention is judged from Git (clean tree including untracked files, HEAD changed, commits ahead) and from
+  // the session state, never from terminal text. The panel does not judge the quality of the commits.
+  // /flow-ship also publishes the pull request: it is ok only when nothing is left to deliver (clean tree, HEAD changed, nothing ahead of the
+  // upstream), and a commit that is still ahead means the PR stage did not finish (the /flow-pr button stays on the card for that).
+  const SETTLE_MS = 30 * 1000; // an idle prompt right after sending may just not have started yet
+  const UNKNOWN_MS = 15 * 60 * 1000; // how long an unknown session may be given the benefit of the doubt
+  // RP176: a commit plus a pull request (the agents run tests and Git checks in between) takes longer than a commit: twice the wait, for /flow-ship only.
+  const SHIP_UNKNOWN_MS = 30 * 60 * 1000;
+  const SHIP_CMDS = ['flow-ship', 'flow-ship-unstage'];
+  const DELIVER_CMDS = [...SHIP_CMDS, 'flow-commit', 'flow-commit-unstage'];
+
+  function commitVerdict(sent, local, session, now = Date.now()) {
+    if (!sent) return null;
+    const ship = SHIP_CMDS.includes(sent.cmd);
+    const name = ship ? '/flow-ship' : '/flow-commit';
+    const unknownMs = ship ? SHIP_UNKNOWN_MS : UNKNOWN_MS;
+    const running = (reason) => ({ state: 'running', reason });
+    const attention = (reason) => ({ state: 'attention', reason });
+    if (!hasLocal(local)) return running('Waiting for the repo state');
+    if (session === 'busy') return running('The session is working');
+    const n = local.files.length;
+    const changed = !!local.head && local.head !== sent.head;
+    if (ship && n === 0 && changed && local.ahead === 0 && !local.noUpstream) return { state: 'ok', reason: 'Committed and published: clean tree and nothing left to deliver' };
+    if (!ship && n === 0 && changed && local.ahead > 0) return { state: 'ok', reason: 'Committed: clean tree and commits ready to deliver' };
+    const elapsed = now - sent.at;
+    const filesLeft = `${n} file${n === 1 ? '' : 's'} still uncommitted after ${name}`;
+    const notDelivered = ship ? 'Committed, but the pull request was not published: run /flow-pr' : 'HEAD changed but no commits are left to deliver';
+    if (session === 'idle' || session === 'closed') {
+      if (elapsed < SETTLE_MS) return running('Waiting for the session to start');
+      if (n > 0) return attention(filesLeft);
+      if (!changed) return attention(session === 'closed' ? `The session closed before ${name} made a commit` : `No new commit after ${name} (HEAD did not change)`);
+      return attention(notDelivered);
+    }
+    if (elapsed < unknownMs) return running('Waiting for the session');
+    if (n > 0) return attention(filesLeft);
+    return attention(changed ? notDelivered : `No change ${unknownMs / 60000} minutes after ${name} and the session state is unknown`);
+  }
+
+  // What the status line says while each command a button can send is running.
+  const RUNNING_LABEL = {
+    'flow-ship': 'shipping…', 'flow-ship-unstage': 'shipping…', 'flow-commit': 'committing…', 'flow-commit-unstage': 'committing…', 'flow-pr': 'creating pull request…',
+    'flow-base': 'updating base branch…', 'flow-base-stash': 'updating base branch…',
+    'fix-pr': 'fixing pull request…', 'put-in-conditions': 'putting repo in conditions…', 'flow-next': 'starting the next task…',
+  };
+  // The GitHub-like color of the progress line of each command (the pending CI chip is always yellow).
+  const RUN_COLOR = { 'flow-ship': 'blue', 'flow-ship-unstage': 'blue', 'flow-commit': 'blue', 'flow-commit-unstage': 'blue', 'flow-pr': 'green', 'flow-base': 'purple', 'flow-base-stash': 'purple', 'fix-pr': 'orange' };
+  const runColor = (cmd) => RUN_COLOR[cmd] || 'gray';
+  // RP233: the reason of a button whose command is not loaded names the command alone (/flow-ship, also for /flow-ship --unstage).
+  const notLoaded = (cmd) => `${(CMD_TEXT[cmd] || `/${cmd}`).split(' ')[0]} is not loaded in this session`;
+  // RP233: the toast after POST /api/pi says "sent" only for a confirmed send; a prompt pi handled or queued says so instead.
+  function sentToast(what, d) {
+    if (d && d.confirmed) return { text: `Sent ${what} to the session`, tone: 'ok' };
+    if (d && d.disposition === 'handled') return { text: `The session handled ${what} without starting a run: check the session`, tone: '' };
+    if (d && d.disposition === 'queued') return { text: `The session queued ${what}: it runs when the current work ends`, tone: '' };
+    return { text: `Sent ${what}, not confirmed: check the session`, tone: '' };
+  }
+  const CMD_TEXT = { 'flow-ship': '/flow-ship', 'flow-ship-unstage': '/flow-ship --unstage', 'flow-commit': '/flow-commit', 'flow-commit-unstage': '/flow-commit --unstage', 'flow-pr': '/flow-pr', 'flow-base': '/flow-base', 'flow-base-stash': '/flow-base --stash' };
+  // The pseudo-verdict of a command whose order is still being sent to the session: it behaves as a running one, with
+  // the label the real running verdict shows for that command.
+  const sendingVerdict = (cmd) => ({ state: 'running', cmd, label: RUNNING_LABEL[cmd] || '', reason: 'Sending the order to the session' });
+  const SESSION_CLOSED = 'The session closed while the command was running';
+  const ASKING = 'waiting for your answer in the session';
+
+  // The CSS animations of the progress lines (pulsing dot, ellipsis) all last this long. The page re-renders #app on
+  // every draw, which restarts a CSS animation; an inline negative animation-delay of `now mod ANIM_MS` puts a
+  // freshly drawn element back at the phase it would have had, so the animation looks continuous across redraws.
+  const ANIM_MS = 1200;
+  const animDelay = (now = Date.now()) => 0 - (now % ANIM_MS);
+
+  // Verdict of any command sent from the page: { state: 'running' | 'ok' | 'attention', reason, label }, or null when
+  // there is no record or the command has no verdict (fix-pr and put-in-conditions are dropped once the session is
+  // idle: a failure answer from the session is a legitimate outcome). `sent` is { cmd, at, head, branch, files, ahead,
+  // busySeen? } recorded when the command was confirmed; `session` is the state of GET /api/pi-status; `prInfo` is the
+  // answer of /api/prs. Judged from Git and the session state, never from terminal text. /flow-ship and
+  // /flow-ship --unstage (and the old /flow-commit pair) are judged by commitVerdict (the unstage ones must also leave an empty index).
+  function flowVerdict(sent, local, session, prInfo, now = Date.now()) {
+    if (!sent) return null;
+    // A session showing a selection dialog is waiting for the person, who is the blocker: stay running, never expire.
+    if (session === 'asking') return { state: 'running', reason: ASKING, label: ASKING, cmd: sent.cmd, asking: true };
+    const label = RUNNING_LABEL[sent.cmd] || '';
+    const done = (v) => (v ? { ...v, label, cmd: sent.cmd } : null);
+    if (DELIVER_CMDS.includes(sent.cmd)) {
+      const v = commitVerdict(sent, local, session, now);
+      if (v && v.state === 'ok' && sent.cmd.endsWith('-unstage') && local.stagedCount > 0) {
+        return done({ state: 'attention', reason: `${local.stagedCount} file${local.stagedCount === 1 ? ' is' : 's are'} still staged after ${CMD_TEXT[sent.cmd]}` });
+      }
+      return done(v);
+    }
+    const running = (reason) => done({ state: 'running', reason });
+    const attention = (reason) => done({ state: 'attention', reason });
+    const noCommit = sent.cmd === 'fix-pr' || sent.cmd === 'put-in-conditions' || sent.cmd === 'flow-next';
+    if (!hasLocal(local)) return running('Waiting for the repo state');
+    if (session === 'busy') return running('The session is working');
+    const text = CMD_TEXT[sent.cmd] || `/${sent.cmd}`;
+    const branch = local.branch || '(detached)';
+    const base = local.base || 'the base branch';
+    let ok = false;
+    let notOk = '';
+    if (sent.cmd === 'flow-pr') {
+      const open = prInfo && Array.isArray(prInfo.prs) ? prInfo.prs : [];
+      ok = local.files.length === 0 && !local.noUpstream && local.ahead === 0 && open.some((p) => p && p.head === local.branch);
+      notOk = `No open pull request for ${branch} after ${text}`;
+    } else if (!noCommit) {
+      const up = local.branch === local.base && local.behind === 0 && local.ahead === 0;
+      // The plain /flow-base asks for a clean tree only when it was clean when sent: files that appeared afterwards are
+      // the person already working on the fresh base branch, not a failed command. A record without the count stays strict.
+      ok = up && (sent.cmd === 'flow-base-stash' || local.files.length === 0 || sent.files === 0);
+      notOk = local.branch === sent.branch ? `Still on ${branch} after ${text}` : `Not on a ${sent.cmd === 'flow-base' ? 'clean, ' : ''}up-to-date ${base} after ${text}`;
+    }
+    if (ok) return done({ state: 'ok', reason: `${text} done` });
+    const elapsed = now - sent.at;
+    const settling = elapsed < SETTLE_MS && !sent.busySeen;
+    if (session === 'closed') return noCommit || settling ? attention(SESSION_CLOSED) : attention(notOk);
+    if (session === 'idle') {
+      if (settling) return running('Waiting for the session to start');
+      return noCommit ? null : attention(notOk);
+    }
+    if (elapsed < UNKNOWN_MS) return running('Waiting for the session');
+    return attention(`No change 15 minutes after ${text} and the session state is unknown`);
+  }
+
+  // ---------- event stream (RP77b) ----------
+  // The text of a stream, frame by frame: the complete frames as { event, data } and the unfinished tail as `rest` (feed it back with the next chunk).
+  // Comments (heartbeat) and fields other than event and data are ignored; a frame without data is no event.
+  function parseSse(buffer) {
+    const events = [];
+    let rest = String(buffer);
+    for (let m = /\r?\n\r?\n/.exec(rest); m; m = /\r?\n\r?\n/.exec(rest)) {
+      const lines = rest.slice(0, m.index).split(/\r?\n/);
+      rest = rest.slice(m.index + m[0].length);
+      let event = 'message';
+      const data = [];
+      for (const line of lines) {
+        if (line.startsWith(':')) continue;
+        const at = line.indexOf(':');
+        const field = at < 0 ? line : line.slice(0, at);
+        const value = at < 0 ? '' : line.slice(at + 1).replace(/^ /, '');
+        if (field === 'event') event = value; else if (field === 'data') data.push(value);
+      }
+      if (data.length) events.push({ event, data: data.join('\n') });
+    }
+    return { events, rest };
+  }
+
+  const EVENT_MAX = 64 * 1024;
+  const isObject = (x) => !!x && typeof x === 'object' && !Array.isArray(x);
+  // RPC2-1 (S1): the `rpc` event carries what one pi session does ({ id, kind, ... }; the id is a repo id). Frames over EVENT_MAX are dropped.
+  const RPC_KINDS = ['event', 'state', 'dialog', 'dialog-closed', 'exit', 'memory', 'mode', 'ended'];
+  // RP238b: why a session that was up died by itself, as a category of the server's closed list (server/rpc.js CAUSES, the same fixed texts); the note says it.
+  const CAUSE_TEXT = {
+    'no-model': 'No model or login is set up: run pi in a terminal to sign in',
+    extension: 'An extension failed to load: start pi in a terminal to see which',
+    session: 'The session id was rejected',
+    folder: 'The repo folder no longer exists',
+  };
+  const endedNote = (p) => (isObject(p) && p.kind === 'ended' && typeof p.cause === 'string' && Object.hasOwn(CAUSE_TEXT, p.cause) ? `The session ended: ${CAUSE_TEXT[p.cause]}` : null);
+  // RP245c: the permission mode of a session, from a closed list; anything else is ignored.
+  const MODE_CATS = ['normal', 'auto', 'yolo', 'super-yolo'];
+  // RP110b: the category of the memory plugin of a session, from a closed list; anything else is ignored.
+  const MEMORY_CATS = ['ready', 'offline', 'disabled', 'error'];
+  const RPC_STATES = ['starting', 'idle', 'busy', 'asking', 'closed'];
+  function rpcEvent(frame) {
+    if (!frame || frame.event !== 'rpc' || typeof frame.data !== 'string' || frame.data.length > EVENT_MAX) return null;
+    let body;
+    try { body = JSON.parse(frame.data); } catch { return null; }
+    return isObject(body) && typeof body.id === 'string' && /^[0-9a-f]{10}$/.test(body.id) && RPC_KINDS.includes(body.kind) ? body : null;
+  }
+  // What the chat shows of one session: { state, text, blocks, error, startedAt } plus `streaming` (a run is on) and `asks` (the pending dialogs, see rpcAskOf). The text is
+  // the blocks in order (the index is the `contentIndex` of pi; thinking and tool blocks leave theirs empty), capped.
+  const RPC_BLOCKS = 64;
+  const RPC_TEXT_MAX = 200000;
+  // RP152: `subs` is how many subagents started and have not ended, `subSince` the moment the first one of them started (0 = none). RP235: the server tells a subagent apart (subagent_start, subagent_end).
+  const rpcBlank = () => ({ state: 'closed', text: '', blocks: [], error: '', startedAt: 0, streaming: false, thinking: false, retry: null, memory: null, mode: null, ctx: null, compacting: false, asks: [], subs: 0, subSince: 0, missing: [], queue: rpcNoQueue(), bash: null });
+  // RP245b: the shell command the person ran with ! or !! ({ command, exclude, output, running, exitCode?, cancelled?, truncated?, open? }); its live output is capped, keeping its end.
+  const BASH_OUT_MAX = 1000000;
+  // RP252: the running command a status reports, or null.
+  const runningShell = (b) => (isObject(b) && b.running === true && typeof b.command === 'string'
+    ? { command: b.command, exclude: b.exclude === true, output: typeof b.output === 'string' ? b.output.slice(-BASH_OUT_MAX) : '', running: true, since: Number.isSafeInteger(b.since) ? b.since : 0 }
+    : null);
+  // RP252: whether the history already holds this finished run (same command, written after it started; 2 s of slack for the clocks), so its live bubble can go.
+  function shellInHistory(b, items) {
+    if (!isObject(b) || b.running === true || !Array.isArray(items)) return false;
+    const since = Number.isSafeInteger(b.since) ? b.since : 0;
+    return items.some((it) => isObject(it) && it.kind === 'shell' && it.command === b.command && Date.parse(it.at) >= since - 2000);
+  }
+  // RP236: the messages waiting for the session, as pi told them last (the server already cut them); a value that is not a list of texts is an empty list.
+  function rpcNoQueue() { return { steering: [], followUp: [] }; }
+  const rpcTexts = (list) => (Array.isArray(list) ? list.filter((t) => typeof t === 'string').slice(0, 20).map((t) => t.slice(0, 4000)) : []);
+  const SUB_MAX = 20;
+  // RP152: the counter of a subagent that is working, as mm:ss (the minutes keep growing past 59). Anything that is not a duration in milliseconds reads 00:00.
+  function subClock(ms) {
+    const s = typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? Math.floor(ms / 1000) : 0;
+    return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  }
+  const rpcInt = (v, min, max) => (Number.isInteger(v) && v >= min && v <= max ? v : null);
+  const rpcText = (blocks) => blocks.filter(Boolean).join('\n\n').slice(0, RPC_TEXT_MAX);
+  // One pending dialog as the card needs it (RPC2-3), or null when it is not well formed. The server already caps what it sends; what is still
+  // too long here is cut and counts as truncated, so the card never offers to approve text it did not get whole.
+  const ASK_METHODS = ['select', 'confirm', 'input', 'editor'];
+  const str = (v, max) => (typeof v === 'string' ? v.slice(0, max) : '');
+  function rpcAskOf(d) {
+    if (!isObject(d) || typeof d.requestId !== 'string' || !d.requestId || d.requestId.length > 200 || !ASK_METHODS.includes(d.method)) return null;
+    const raw = Array.isArray(d.options) ? d.options : [];
+    const cut = (typeof d.title === 'string' && d.title.length > 300) || (typeof d.message === 'string' && d.message.length > 4000) || raw.length > 20 || raw.some((o) => typeof o === 'string' && o.length > 200);
+    return { requestId: d.requestId, method: d.method, title: str(d.title, 300), message: str(d.message, 4000), options: raw.slice(0, 20).map((o) => str(o, 200)), truncated: d.truncated === true || cut, expiresAt: Number.isFinite(d.expiresAt) ? d.expiresAt : null };
+  }
+  // A dialog already there keeps its place (the same requestId is never added twice).
+  const rpcAsks = (a, add, remove) => {
+    const list = (Array.isArray(a) ? a : []).filter((x) => isObject(x) && x.requestId !== remove);
+    if (add) { const at = list.findIndex((x) => x.requestId === add.requestId); if (at >= 0) list[at] = add; else list.push(add); }
+    return list.slice(0, 20);
+  };
+  // A pure reducer: (entry, payload of rpcEvent, now) -> { entry, reload }. `reload` is true when a run settled and the history must be read ONCE.
+  function rpcReduce(prev, p, now = 0) {
+    const e = { ...rpcBlank(), ...(isObject(prev) ? prev : {}) };
+    e.blocks = Array.isArray(e.blocks) ? e.blocks.slice(0, RPC_BLOCKS) : [];
+    let reload = false;
+    let ctx = false; // RP139: the context of the session must be read again (a run or a compaction ended)
+    if (!isObject(p)) return { entry: e, reload, ctx };
+    if (p.kind === 'state' && RPC_STATES.includes(p.state)) { e.state = p.state; if (p.state === 'busy') e.streaming = true; if (p.state !== 'busy' && p.state !== 'asking') Object.assign(e, { subs: 0, subSince: 0, queue: rpcNoQueue() }); } // RP236b (S2): a free session has nothing waiting
+    else if (p.kind === 'exit') Object.assign(e, { state: 'closed', blocks: [], text: '', streaming: false, thinking: false, retry: null, memory: null, mode: null, ctx: null, compacting: false, asks: [], subs: 0, subSince: 0, queue: rpcNoQueue(), bash: null });
+    else if (p.kind === 'memory') { if (MEMORY_CATS.includes(p.memory)) e.memory = p.memory; }
+    else if (p.kind === 'mode') { if (MODE_CATS.includes(p.mode)) e.mode = p.mode; } // RP245c
+    else if (p.kind === 'dialog') e.asks = rpcAsks(e.asks, rpcAskOf(p));
+    else if (p.kind === 'dialog-closed' && typeof p.requestId === 'string') e.asks = rpcAsks(e.asks, null, p.requestId);
+    else if (p.kind === 'event' && isObject(p.record)) {
+      // RP235: the record is in the panel's own vocabulary (server/rpchost.js, toPanel); no name of pi is read here.
+      const r = p.record;
+      const at = r.index;
+      if (r.type === 'run_start') Object.assign(e, { blocks: [], streaming: true, thinking: false, retry: null, error: '', startedAt: now, subs: 0, subSince: 0 });
+      else if (r.type === 'run_settled') { e.streaming = false; e.thinking = false; e.retry = null; e.subs = 0; e.subSince = 0; e.queue = rpcNoQueue(); reload = true; ctx = true; } // RP236: settled means pi will not go on, so nothing waits any more
+      else if (r.type === 'queue') e.queue = { steering: rpcTexts(r.steering), followUp: rpcTexts(r.followUp) };
+      // RP252: a command started from another tab (or before a reload) opens its bubble here; its end closes it and reads the history once, where its run is kept.
+      else if (r.type === 'bash_start') { if (typeof r.command === 'string' && !(isObject(e.bash) && e.bash.running === true)) e.bash = { command: r.command, exclude: r.exclude === true, output: '', running: true, since: Number.isSafeInteger(r.since) ? r.since : 0 }; }
+      else if (r.type === 'bash_end') { if (isObject(e.bash)) e.bash = { ...e.bash, running: false }; reload = true; }
+      else if (r.type === 'bash_output') { if (isObject(e.bash) && e.bash.running === true && typeof r.delta === 'string') e.bash = { ...e.bash, output: (String(e.bash.output || '') + r.delta).slice(-BASH_OUT_MAX) }; }
+      else if (r.type === 'run_end') { ctx = true; e.subs = 0; e.subSince = 0; }
+      // RP152: a subagent that starts is counted (the clock keeps the first start) and one that ends is taken out; never below zero, never above SUB_MAX.
+      else if (r.type === 'subagent_start') { e.subs = Math.min(SUB_MAX, (Number.isInteger(e.subs) && e.subs > 0 ? e.subs : 0) + 1); if (!(e.subSince > 0)) e.subSince = now; }
+      else if (r.type === 'subagent_end') { e.subs = Math.max(0, (Number.isInteger(e.subs) ? e.subs : 0) - 1); if (e.subs === 0) e.subSince = 0; }
+      // RP140: a compaction (the person's, or one pi starts by itself) is on from its start to its end; the end also asks for the context (RP139).
+      else if (r.type === 'compact_start') e.compacting = true;
+      else if (r.type === 'compact_end') { e.compacting = false; ctx = true; }
+      // RP105c: pi is retrying a failed request on its own (live only: the history keeps no record). Only valid numbers are kept.
+      else if (r.type === 'retry_start') e.retry = { attempt: rpcInt(r.attempt, 1, 1000), max: rpcInt(r.max, 1, 1000), delayMs: rpcInt(r.delayMs, 0, 3600000) };
+      else if (r.type === 'retry_end') e.retry = null;
+      // RP155: every message starts with an empty live text. The blocks are kept BY POSITION inside a message and were cleared only at the next run start, so the text of the message before stayed in the position a later one did
+      // not use (measured on the real stream: blocks [110] then [110, 1625]) and a text delta was added to whatever its position already held. Only the text and the reasoning flag are reset: nothing else of the entry.
+      else if (r.type === 'stream' && r.part === 'reset') { e.blocks = []; e.thinking = false; }
+      else if (r.type === 'stream' && Number.isInteger(at) && at >= 0 && at < RPC_BLOCKS) {
+        for (let i = e.blocks.length; i < at; i++) e.blocks[i] = '';
+        const text = r.part === 'text';
+        if (text && r.phase === 'start') e.blocks[at] = ''; // RP155: a text block starts empty, whatever the position held
+        // RP104: the reasoning only turns a flag on and off (the server never sends its text); the first text of the run ends it.
+        if (r.part === 'thinking' && (r.phase === 'start' || r.phase === 'delta')) e.thinking = true;
+        else if ((r.part === 'thinking' && r.phase === 'end') || text) e.thinking = false;
+        if (text && r.phase === 'delta' && typeof r.delta === 'string') e.blocks[at] = ((e.blocks[at] || '') + r.delta).slice(0, RPC_TEXT_MAX);
+        else if (text && r.phase === 'end' && typeof r.content === 'string') e.blocks[at] = r.content;
+      }
+      if (r.type === 'run_start' || r.type === 'stream') e.text = rpcText(e.blocks);
+    }
+    return { entry: e, reload, ctx };
+  }
+  // RP139 (S28): the share of the context window a session uses, as three validated numbers and nothing else (GET /api/rpc/context). A null stays null (unknown); a percent is clamped to 0..100.
+  const ctxNum = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null);
+  function rpcWithContext(prev, a) {
+    const o = isObject(a) ? a : {};
+    const window = Number.isSafeInteger(o.window) && o.window > 0 ? o.window : null;
+    const percent = ctxNum(o.percent);
+    // RP239: the totals of the session: a cost up to a million and a safe integer of tokens, else null.
+    const totals = { cost: ctxNum(o.cost) !== null && o.cost <= 1e6 ? o.cost : null, sessionTokens: Number.isSafeInteger(o.sessionTokens) && o.sessionTokens >= 0 ? o.sessionTokens : null };
+    return { ...rpcBlank(), ...(isObject(prev) ? prev : {}), ctx: window === null ? { tokens: null, percent: null, window: null, ...totals } : { tokens: ctxNum(o.tokens), percent: percent === null ? null : Math.min(100, percent), window, ...totals } };
+  }
+  // GET /api/rpc/status: the state and the pending dialogs (by `requestId`). A run that is not on any more leaves no streaming text.
+  function rpcFromStatus(prev, st) {
+    const e = { ...rpcBlank(), ...(isObject(prev) ? prev : {}), subs: 0, subSince: 0 }; // RP152: after an open or a (re)connect nothing is known of a subagent: not «working»
+    if (!isObject(st) || !RPC_STATES.includes(st.state)) return e;
+    e.state = st.state;
+    e.memory = MEMORY_CATS.includes(st.memory) ? st.memory : st.state === 'closed' ? null : e.memory; // RP110b: a closed session has no memory to report
+    e.mode = MODE_CATS.includes(st.mode) ? st.mode : st.state === 'closed' ? null : (MODE_CATS.includes(e.mode) ? e.mode : null); // RP245c: likewise for the permission mode
+    if (st.state === 'closed') e.ctx = null; // RP139: a closed session has no context to report
+    e.compacting = st.state !== 'closed' && st.compacting === true; // RP140: the status is the truth about a compaction in progress
+    // RP233: the keys whose command the session did not load; a status without the list keeps what was known, a closed session knows none.
+    if (st.state === 'idle') e.queue = rpcNoQueue(); // RP236b (S2): a free session has nothing waiting, even if the end of its run was missed (kept apart: it must not skip `missing`)
+    if (st.state === 'closed') { e.missing = []; e.queue = rpcNoQueue(); e.bash = null; }
+    else if (Array.isArray(st.missing)) e.missing = st.missing.filter((k) => typeof k === 'string' && (Object.hasOwn(CMD_TEXT, k) || k === 'flow-next'));
+    // RP252: the status is the truth about a running shell command: it rebuilds the bubble (a reload, another tab) and its absence ends a running one. The bubble of the
+    // tab that sent it (`own`) is ended only by its own answer: a start answer or a status read sent before the server took the command does not report it yet.
+    const sh = st.state === 'closed' ? null : runningShell(st.bash);
+    const was = isObject(e.bash) ? e.bash : null;
+    if (sh) e.bash = { ...sh, ...(was && was.open === true ? { open: true } : {}), ...(was && was.own === true && was.running === true && was.command === sh.command ? { own: true } : {}) }; // only this tab's running command stays its own
+    else if (was && was.running === true && was.own !== true) e.bash = null;
+    e.asks = (Array.isArray(st.pendingDialogs) ? st.pendingDialogs : []).map(rpcAskOf).filter(Boolean).slice(0, 20);
+    e.streaming = st.state === 'busy' || st.state === 'asking';
+    if (!e.streaming) Object.assign(e, { blocks: [], text: '', thinking: false, retry: null });
+    return e;
+  }
+  // RP79 (S68, S74): the page keeps the last chats it read, per repo, and paints them at once when the card is opened again. The use order
+  // is a counter, never a clock. A cached live state is never reused: chatFromCache replaces it with 'unknown' (no question, no answer buttons).
+  let cacheTick = 0;
+  const plainCopy = (x) => (x === undefined ? null : JSON.parse(JSON.stringify(x)));
+  const validCacheId = (id) => typeof id === 'string' && id !== '';
+  function chatCachePut(cache, id, entry, max = 8) {
+    if (!validCacheId(id) || !entry || typeof entry !== 'object' || !entry.info || typeof entry.info !== 'object') return false;
+    if (!Object.hasOwn(cache, id) && Object.keys(cache).length >= max) {
+      const oldest = Object.keys(cache).reduce((a, b) => (cache[b].at < cache[a].at ? b : a));
+      delete cache[oldest];
+    }
+    cache[id] = { info: plainCopy(entry.info), hist: plainCopy(entry.hist), key: entry.key, at: cacheTick++ };
+    return true;
+  }
+  function chatCacheGet(cache, id) {
+    if (!validCacheId(id) || !Object.hasOwn(cache, id)) return null;
+    cache[id].at = cacheTick++;
+    const { info, hist, key } = cache[id];
+    return { info: plainCopy(info), hist: plainCopy(hist), key };
+  }
+  const chatFromCache = (entry) => (entry ? { info: { ...plainCopy(entry.info), live: { state: 'unknown', count: 0 } }, hist: plainCopy(entry.hist), key: entry.key, cached: true } : null);
+
+  // With the stream open the chat poll is only a safety net; without it it keeps 5 s.
+  const eventsPlan = ({ connected }) => (connected ? { chatMs: 30000 } : { chatMs: 5000 });
+  const eventsRetryMs = (attempt) => Math.min(30000, 1000 * 2 ** attempt);
+  // The server sends a heartbeat every 15 s: three missed beats mean the stream is dead (a server that vanished without closing it).
+  const eventsStale = ({ connected, lastByteAt, now }) => connected === true && Number.isFinite(lastByteAt) && Number.isFinite(now) && now - lastByteAt >= 45000;
+
+  // RP80: what the page takes from a /api/board answer. A fact is dropped when the page read it directly at the same time or later
+  // (lastAt[id][kind]; an unknown page time never blocks), and so is its error. `missing` lists, in board order, the repos that came
+  // without a good local, prs, roadmap or state (req does not count; a fact the page guard dropped still came).
+  const BOARD_KINDS = ['local', 'prs', 'roadmap', 'state', 'req'];
+  function boardApply(board, { lastAt = {} } = {}) {
+    const set = {};
+    const missing = [];
+    for (const [id, e] of Object.entries(board.repos || {})) {
+      const page = lastAt[id] || {};
+      const stale = (k) => Number.isFinite(page[k]) && Number.isFinite((e.at || {})[k]) && page[k] >= e.at[k];
+      const out = {};
+      for (const k of BOARD_KINDS) if (e[k] != null && !stale(k)) out[k] = e[k];
+      const errors = Object.fromEntries(Object.entries(e.errors || {}).filter(([k]) => !stale(k)));
+      if (Object.keys(errors).length) out.errors = errors;
+      set[id] = out;
+      if (BOARD_KINDS.slice(0, 4).some((k) => e[k] == null)) missing.push(id);
+    }
+    return { set, rev: board.rev, refreshing: board.refreshing || [], missing };
+  }
+  const htmlEsc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  // RP87 (S9): the change chips of a repo card, shared by the board card (Work) and the Summary card, which used to build them twice. `c` is the model's
+  // `changes` ({ files, added, deleted, ahead, behind, noUpstream }) or null (not loaded). Pure; anything that is not a count reads as 0; the id is escaped.
+  function changeChips(c, id) {
+    if (!isObject(c)) return '';
+    const n = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
+    const files = n(c.files);
+    return (files ? `<button class="chip yellow chip-btn" data-act="diff" data-id="${htmlEsc(id)}" title="View diff">● ${files} file${files === 1 ? '' : 's'} <span class="add">+${n(c.added)}</span> <span class="del">−${n(c.deleted)}</span></button>` : '')
+      + (n(c.ahead) ? `<span class="chip blue">↑ ${n(c.ahead)} unpushed${c.noUpstream ? ' · no upstream' : ''}</span>` : '');
+  }
+
+  // RP94c (S9): the chip of a repo's open pull request(s) with the state of the checks, for the Summary card. `prs` is the page's list of open PRs ({ number, title, checks });
+  // none (or not a list) draws nothing. State is never colour alone: the chip has the number, a symbol and the counts. One PR: "PR #12 ✔ 5/5". Several: ONE chip with the
+  // count and the worst state (failed, then running, then passing, then none); the tooltip lists every PR. Total, and escaped.
+  // RP94d: the open PRs that have a number (anything else is skipped); the size GitHub said for one PR ({ add, del, files } or null: half a size is not a size).
+  const numberedPrs = (prs) => (Array.isArray(prs) ? prs : []).filter((p) => isObject(p) && typeof p.number === 'number' && Number.isFinite(p.number));
+  const countOf = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : null);
+  const sizeOfPr = (p) => (countOf(p.additions) !== null && countOf(p.deletions) !== null ? { add: countOf(p.additions), del: countOf(p.deletions), files: countOf(p.changedFiles) } : null);
+  const sizeText = (s) => `+${s.add} −${s.del}${s.files !== null ? ` · ${s.files} file${s.files === 1 ? '' : 's'}` : ''}`;
+  const LARGE_PR_LINES = 400;
+
+  // RP94d: how long uncommitted work has sat untouched, from the newest edit among the changed files (`lastChangeMs`). Nothing under a day (a day exactly counts), nothing for a
+  // future or missing time. Gray under a week, yellow from a week. Total.
+  function idleChip(lastChangeMs, now = Date.now()) {
+    if (typeof lastChangeMs !== 'number' || !Number.isFinite(lastChangeMs) || typeof now !== 'number' || !Number.isFinite(now)) return '';
+    const days = Math.floor((now - lastChangeMs) / (24 * 60 * 60 * 1000));
+    if (days < 1) return '';
+    const when = new Date(lastChangeMs).toISOString().slice(0, 16).replace('T', ' ');
+    return `<span class="chip ${days >= 7 ? 'yellow' : 'gray'}" title="Newest uncommitted change: ${when} UTC">⏳ edited ${days} d ago</span>`;
+  }
+
+  // RP94d: a red chip for the open PR(s) that conflict with the base branch (GitHub's merge state DIRTY), with their numbers. Behind and blocked are not conflicts. Total.
+  function conflictChip(prs) {
+    const bad = numberedPrs(prs).filter((p) => p.mergeStateStatus === 'DIRTY');
+    return bad.length ? `<span class="chip red" title="Merge conflicts with the base branch">✘ merge conflict ${bad.map((p) => `#${p.number}`).join(', ')}</span>` : '';
+  }
+
+  // RP94d: a yellow chip for the LARGEST open PR when it changes 400 lines or more (the ceiling this project uses for its own PRs); the tooltip has its title and size. A PR whose
+  // size GitHub did not say is never large. Total, and escaped.
+  function sizeChip(prs) {
+    let best = null;
+    for (const p of numberedPrs(prs)) {
+      const s = sizeOfPr(p);
+      if (s && s.add + s.del >= LARGE_PR_LINES && (!best || s.add + s.del > best.s.add + best.s.del)) best = { p, s };
+    }
+    if (!best) return '';
+    const title = typeof best.p.title === 'string' && best.p.title ? ` ${best.p.title}` : '';
+    return `<span class="chip yellow" title="${htmlEsc(`#${best.p.number}${title} — ${sizeText(best.s)}`)}">large PR #${best.p.number} · +${best.s.add} −${best.s.del}</span>`;
+  }
+
+  // RP170: the CI of ONE PR, the one reading of its numbers: the PR chip of the card and the state label of the chat both read them from here, so they cannot disagree. Total: anything that is not a PR with a number and a
+  // known state of checks is null, and so is a passed CI or no checks (there is nothing to say). Whole numbers only; anything else is 0.
+  const ciN = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= Number.MAX_SAFE_INTEGER ? Math.floor(v) : 0);
+  const ciKind = (p) => { const s = isObject(p.checks) ? p.checks.state : 'none'; return s === 'none' || s === undefined ? 'none' : s === 'success' ? 'success' : s === 'failed' ? 'failed' : 'pending'; };
+  const CI_STATES = { pending: 'running', failed: 'failed' };
+  function ciOf(pr) {
+    if (!isObject(pr) || typeof pr.number !== 'number' || !Number.isFinite(pr.number) || !isObject(pr.checks) || !['none', 'success', 'failed', 'pending'].includes(pr.checks.state)) return null;
+    const kind = CI_STATES[ciKind(pr)];
+    const c = pr.checks;
+    return kind ? { kind, pending: ciN(c.pending), failed: ciN(c.failed), passed: ciN(c.passed), total: ciN(c.total), number: pr.number } : null;
+  }
+  // RP170: the turning icon of a CI that is running: the dashed ring of the CI list (RP156), the same one the state label of the chat draws; it turns with the animation of the page (ck-spin).
+  const CI_SPIN = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="6" stroke-dasharray="3 2.2"/></svg>';
+
+  function prChip(prs) {
+    const list = numberedPrs(prs);
+    if (!list.length) return '';
+    const n = ciN;
+    const kind = ciKind;
+    const SPIN = '\u0001'; // a mark no text holds: swapped for the icon after the escape
+    const counts = (p) => { const c = isObject(p.checks) ? p.checks : {}; return `${n(c.passed)}/${n(c.total)}`; };
+    const describe = (p) => {
+      const c = isObject(p.checks) ? p.checks : {};
+      return { none: 'no checks', success: `✔ ${counts(p)} checks`, failed: `✘ ${n(c.failed)} failed · ${counts(p)} checks`, pending: `… ${n(c.pending)} running · ${counts(p)} checks` }[kind(p)];
+    };
+    const tip = list.map((p) => `#${p.number}${typeof p.title === 'string' && p.title ? ` ${p.title}` : ''} — ${describe(p)}${sizeOfPr(p) ? ` · ${sizeText(sizeOfPr(p))}` : ''}`).join('\n');
+    const kinds = list.map(kind);
+    const worst = ['failed', 'pending', 'success', 'none'].find((k) => kinds.includes(k));
+    const tone = { failed: 'red', pending: 'yellow', success: 'green', none: 'gray' }[worst];
+    let text;
+    if (list.length === 1) {
+      const p = list[0];
+      const c = isObject(p.checks) ? p.checks : {};
+      text = `PR #${p.number} ${{ none: '· no checks', success: `✔ ${counts(p)}`, failed: `✘ ${n(c.failed)} failed`, pending: `${SPIN}${n(c.pending)} running` }[worst]}`;
+    } else {
+      const count = (k) => kinds.filter((x) => x === k).length;
+      const tail = { failed: `✘ ${count('failed')} failing`, pending: `${SPIN}${count('pending')} running`, success: count('success') === list.length ? '✔ all passing' : `✔ ${count('success')} passing`, none: '· no checks' }[worst];
+      text = `${list.length} PRs ${tail}`;
+    }
+    return `<span class="chip ${tone}" title="${htmlEsc(tip)}">${text.split(SPIN).map(htmlEsc).join(`<i aria-hidden="true">${CI_SPIN}</i>`)}</span>`; // RP170: what is running shows the turning icon of the CI where the dots were; the rest of the text is escaped as ever
+  }
+
+  // RP86 (S9): ONE read model per repo. The page keeps each fact of a repo in its own map (local, prs, roadmap, state, req) and the Summary row in another; the
+  // board cards, the Summary cards, the "go work on" strip and the Files tab used to read those maps each its own way. This joins them, pure: `loaded` is what
+  // the Summary button needed (a good local state with its file list AND a good PR answer), `changes` the Summary chips (null until the local state loads), and
+  // `row` the Summary row with a free session lifted to "working" while a command of the repo runs (a copy: the server answer is never changed).
+  function repoModel(facts) {
+    const x = isObject(facts) ? facts : {};
+    const local = isObject(x.local) ? x.local : null;
+    const prs = isObject(x.prs) ? x.prs : null;
+    const l = local || {};
+    const p = prs || {};
+    const list = Array.isArray(p.prs) ? p.prs : [];
+    const files = Array.isArray(l.files) ? l.files : null;
+    const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    const row = isObject(x.row) ? x.row : null;
+    return {
+      l, p, prs: list,
+      dirty: !!files && files.length > 0,
+      unpushed: num(l.ahead) > 0,
+      ready: list.filter((q) => isObject(q) && q.ready).length,
+      loaded: !!local && !local.error && !!files && !!prs && !prs.error,
+      changes: local && !local.error && files ? { files: files.length, added: num(l.added), deleted: num(l.deleted), ahead: num(l.ahead), behind: num(l.behind), noUpstream: !!l.noUpstream } : null,
+      roadmap: x.roadmap ?? null,
+      state: x.state ?? null,
+      req: x.req ?? null,
+      row: row && isObject(row.session) && row.session.state === 'free' && x.running === true ? { ...row, session: { ...row.session, state: 'working' } } : row,
+    };
+  }
+
+  // RP88b (S9, S10): the frame of a repo card, ONE function for the Summary card and the board card. `m` carries ready HTML for what differs on purpose (the caller
+  // escapes it) and the raw text it must escape itself (id, label, branch). Mode 'summary': { id, label, cls, current, title, busy, identity, commit, branch: { text, title }, chips, meta,
+  // body }. Mode 'work': { attn, top, before: [lines], branch, between: [lines], chips, after: [lines] }: one line each, in that order. Mode 'compact' (RP88c, the clean row): { identity, branch, tail, actions, after: [lines] }. Total: anything else draws ''.
+  function RepoCard(m, mode) {
+    if (!isObject(m)) return '';
+    const e = (v) => htmlEsc(v == null ? '' : v);
+    const b = isObject(m.branch) ? m.branch : {};
+    const s = (v) => (typeof v === 'string' ? v : '');
+    const chips = s(m.chips);
+    if (mode === 'summary') {
+      return `<article class="rs-card${s(m.cls)}" data-id="${e(m.id)}" data-act="chat-open" tabindex="0"${m.current ? ' aria-current="true"' : ''} aria-label="${e(m.label)}"${m.title ? ` title="${e(m.title)}"` : ''}${m.busy ? ' aria-busy="true"' : ''}>
+      <div class="rs-l1">${s(m.identity)}<span class="mono rs-branch" title="${e(b.title)}">${e(b.text)}</span>${s(m.commit)}${chips ? `<span class="rs-chips">${chips}</span>` : ''}<span class="rs-spacer"></span>${s(m.meta)}</div>
+      <div class="rs-l2">${s(m.body)}</div>
+    </article>`;
+    }
+    if (mode === 'work') {
+      const lines = (a) => (Array.isArray(a) ? a.map(s) : []);
+      return `<div class="card ${m.attn ? 'attn' : ''}">
+    ${[s(m.top), ...lines(m.before), `<div class="branch one-line" title="${e(b.title)}">${e(b.text)}</div>`, ...lines(m.between), chips ? `<div class="chips">${chips}</div>` : '', ...lines(m.after)].join('\n    ')}
+  </div>`;
+    }
+    if (mode === 'compact') {
+      const rest = Array.isArray(m.after) ? m.after.map(s) : [];
+      return `<div class="clean-row">
+    ${[s(m.identity), `<span class="branch" title="${e(b.title)}">${e(b.text)}</span>${s(m.tail)}`, s(m.actions), ...rest].join('\n    ')}
+  </div>`;
+    }
+    return '';
+  }
+
+  // The wait before the next board request: 3 s while it works, then doubling per failure up to 30 s.
+  const boardWait = ({ ok, failures }) => (ok ? 3000 : Math.min(30000, 3000 * 2 ** failures));
+
+  // RP62 (S61, S77): the Claude usage bar. `usage` is the answer of /api/usage; opts { now, timeZone } are for tests (default: the clock and the local zone).
+  // Result { state: 'ok' | 'old' | 'none', five, seven: { text, tone: '' | 'warn' | 'error' | 'dim' }, label, title }. 'none' (no file, or no window at all) wins over 'old'.
+  const USAGE_WARN = 70;
+  const USAGE_ERROR = 90;
+  const USAGE_NONE_TITLE = 'Claude usage: the usage file has not been written yet, or the usage is not reported by the session. Sessions already open must be restarted to report it.';
+  const USAGE_TITLE = 'Claude usage: share of the 5-hour and 7-day limits used, and when each resets (↻). A dash means the window has reset or is not reported.';
+
+  function usageParts(ms, timeZone) {
+    const f = new Intl.DateTimeFormat('en-US', { timeZone, hourCycle: 'h23', weekday: 'short', year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const p = Object.fromEntries(f.formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+    return { day: `${p.year}-${p.month}-${p.day}`, weekday: p.weekday, time: `${p.hour}:${p.minute}` };
+  }
+
+  // RP96: the time left, as "<1m", "59m", "2h 29m" (under a day) or "4d 14h". Total: anything that is not a positive finite number reads "<1m".
+  function usageRemaining(ms) {
+    const m = Number.isFinite(ms) && ms > 0 ? Math.floor(ms / 60000) : 0;
+    if (m < 1) return '<1m';
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    return h < 24 ? `${h}h ${m % 60}m` : `${Math.floor(h / 24)}d ${h % 24}h`;
+  }
+  const USAGE_PACE_MARGIN = 5; // points over the share of the window already run before it counts as "ahead of the clock"
+  const NO_WINDOW = { percent: null, left: null, elapsed: null, reset: null, ahead: false };
+
+  // `span` is the length of the window in ms. Besides the RP62 text and tone it carries what the meters draw: the percent, the time left, the share of the
+  // window already run (0 to 1), the reset text and whether the use runs ahead of the clock (never for an old file).
+  function usageWindow(name, w, { now, timeZone, old, span }) {
+    if (!w || w.expired || typeof w.percent !== 'number') return { text: `${name} –`, tone: 'dim', ...NO_WINDOW };
+    const at = usageParts(w.resetAt, timeZone);
+    const reset = at.day === usageParts(now, timeZone).day ? at.time : `${at.weekday} ${at.time}`;
+    const tone = old ? 'dim' : w.percent >= USAGE_ERROR ? 'error' : w.percent >= USAGE_WARN ? 'warn' : '';
+    const run = Math.min(100, Math.max(0, Math.round((1 - (w.resetAt - now) / span) * 100)));
+    return { text: `${name} ${w.percent}% ↻${reset}`, tone, percent: w.percent, left: usageRemaining(w.resetAt - now), elapsed: run / 100, reset, ahead: !old && w.percent - run > USAGE_PACE_MARGIN };
+  }
+
+  function usageAge(ms) {
+    const min = Math.max(0, Math.floor(ms / 60000));
+    return min < 60 ? `${min} min ago` : `${Math.floor(min / 60)} h ago`;
+  }
+
+  function usageView(usage, { now = Date.now(), timeZone } = {}) {
+    const u = isObject(usage) ? usage : {};
+    const old = u.available === true && u.stale === true;
+    const five = usageWindow('5h', u.five, { now, timeZone, old, span: 5 * 3600000 });
+    const seven = usageWindow('7d', u.seven, { now, timeZone, old, span: 7 * 86400000 });
+    const windows = `${five.text} · ${seven.text}`;
+    if (u.available !== true || (!u.five && !u.seven)) return { state: 'none', five, seven, label: 'Claude usage: no data', title: USAGE_NONE_TITLE };
+    const updated = Number.isFinite(u.updatedAt) ? usageAge(now - u.updatedAt) : null; // RP96: how old the data is, always known for the popover
+    if (!old) return { state: 'ok', five, seven, label: windows, title: USAGE_TITLE, age: null, updated };
+    return { state: 'old', five, seven, label: `${windows} · ${usageAge(now - u.updatedAt)}`, title: `${USAGE_TITLE} The usage file is old: the numbers may have changed.`, age: updated, updated };
+  }
+
+  // RP96 (S12, S13): the header element as HTML, from a usageView result. Pure and total; every text goes through usageEsc and the only numbers that reach a
+  // style attribute are integers clamped to 0..100. A message (no data) is just its text; otherwise one compact meter per window (name, bar with fill and pace
+  // mark, percent, time left) and, hidden until hover, click or focus, the popover with the detail.
+  const usageEsc = htmlEsc;
+  const usagePct = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(100, Math.max(0, Math.round(v))) : null);
+  const USAGE_WINDOWS = [['five', '5h', 'Session (5 h)'], ['seven', '7d', 'Weekly (7 d)']];
+  // RP192 (S18), RP211 (S23): the numbers of the 26 px ring of the phone (centre 13, arc radius 10.5), from the clamped percent and the share of the window gone. Angles run clockwise from the top; the tick is a short radial line across the arc.
+  function ringGeometry(pct, run) {
+    const p = usagePct(pct);
+    const a = ((usagePct(run) ?? 0) / 100) * 2 * Math.PI;
+    const at = (r) => [Math.round((13 + r * Math.sin(a)) * 100) / 100, Math.round((13 - r * Math.cos(a)) * 100) / 100];
+    const [x1, y1] = at(7.5);
+    const [x2, y2] = at(12.5);
+    return { dash: p, tick: { x1, y1, x2, y2 }, font: p !== null && p >= 100 ? 8 : 9.5 };
+  }
+  const ringText = (txt, font) => `<text x="13" y="${Math.round((13 + font * 0.36) * 100) / 100}" text-anchor="middle" font-size="${font}" font-weight="600">${txt}</text>`;
+  function usageHtml(view) {
+    const v = isObject(view) ? view : {};
+    if (v.state !== 'ok' && v.state !== 'old') return usageEsc(v.label);
+    const meters = [];
+    const details = [];
+    for (const [key, name, title] of USAGE_WINDOWS) {
+      const w = isObject(v[key]) ? v[key] : {};
+      const tone = ['warn', 'error', 'dim'].includes(w.tone) ? w.tone : '';
+      const pct = usagePct(w.percent);
+      const cls = tone ? ` usage-${tone}` : '';
+      if (pct === null) {
+        meters.push(`<span class="um usage-dim" data-win="${name}"><span class="um-name">${name}</span><svg class="um-ring" width="26" height="26" viewBox="0 0 26 26" role="img" aria-label="${name}: no data"><circle class="um-track" cx="13" cy="13" r="10.5" fill="none" stroke-width="2.5"/>${ringText('–', 9.5)}</svg><span class="um-pct">–</span></span>`);
+        details.push(`<div class="up-win usage-dim"><div class="up-title">${title}</div><div class="up-line"><span>No data: the window reset or is not reported</span></div></div>`);
+        continue;
+      }
+      const run = usagePct(typeof w.elapsed === 'number' ? w.elapsed * 100 : null) ?? 0;
+      const said = `${name}: ${pct}% used, ${run}% of the window gone${w.ahead === true ? ', more than the clock' : ''}`;
+      const bar = (c) => `<span class="${c}" role="img" aria-label="${usageEsc(said)}"><i class="um-fill" style="width:${pct}%"></i><i class="um-pace" style="left:${run}%"></i></span>`;
+      const g = ringGeometry(pct, run);
+      // RP211: the phone shows the time left next to the ring, compact («2h29m»), so the ring's own name says it too; the desktop um-left keeps its spaced text
+      const left = typeof w.left === 'string' && w.left.trim() ? w.left : '';
+      const ringSaid = left ? `${said}, resets in ${left}` : said;
+      const time = left ? `<span class="um-time" aria-hidden="true">${usageEsc(left.replace(/\s+/g, ''))}</span>` : '';
+      const ring = `<svg class="um-ring" width="26" height="26" viewBox="0 0 26 26" role="img" aria-label="${usageEsc(ringSaid)}"><circle class="um-track" cx="13" cy="13" r="10.5" fill="none" stroke-width="2.5"/><circle class="um-arc" cx="13" cy="13" r="10.5" fill="none" stroke-width="2.5" pathLength="100" stroke-dasharray="${g.dash} 100" transform="rotate(-90 13 13)"/><line class="um-tick" x1="${g.tick.x1}" y1="${g.tick.y1}" x2="${g.tick.x2}" y2="${g.tick.y2}" stroke-width="1.4"/>${ringText(pct, g.font)}</svg>`;
+      const flag = tone === 'warn' || tone === 'error' ? '<b class="um-flag" aria-hidden="true">⚠</b>' : '';
+      meters.push(`<span class="um${cls}" data-win="${name}"><span class="um-name">${name}</span>${ring}${time}${bar('um-bar')}<span class="um-pct">${flag}${pct}%</span><span class="um-left">${usageEsc(w.left)}</span></span>`);
+      details.push(`<div class="up-win${cls}"><div class="up-title">${title}</div>${bar('um-bar up-bar')}<div class="up-line"><span>${pct}% used</span><span>Resets in ${usageEsc(w.left)}</span></div><div class="up-sub">Resets at ${usageEsc(w.reset)} · ${run}% of the window gone</div>${w.ahead === true ? '<div class="up-warn">⚠ Using it faster than the clock</div>' : ''}</div>`);
+    }
+    // RP147: an old file is a small yellow dot (first, as in the design) whose help text says how old the data is: never a loose «N min ago».
+    const dot = v.state === 'old' && v.age ? `<span class="um-old" aria-hidden="true" title="Usage data is ${usageEsc(String(v.age).replace(/ ago$/, ' old'))}"></span>` : '';
+    const note = v.state === 'old' ? '<div class="up-note">The usage file is old: the numbers may have changed.</div>' : '';
+    const foot = v.updated ? `<div class="up-foot">Updated ${usageEsc(v.updated)}</div>` : '';
+    return `${dot}${meters.join('')}<div class="usage-pop" role="group" aria-label="Claude usage details">${details.join('')}${note}${foot}</div>`;
+  }
+
+  // RP181: the page says "not updating" only when it is visible and 90 s have passed since the later of the last good answer and the moment it became visible.
+  const STALLED_MS = 90000;
+  const stalledNow = (a) => {
+    const { now, aliveAt, hidden } = a || {};
+    const visibleAt = a && a.visibleAt === undefined ? 0 : a && a.visibleAt;
+    if (hidden || ![now, aliveAt, visibleAt].every(Number.isFinite)) return false;
+    return now - Math.max(aliveAt, visibleAt) > STALLED_MS;
+  };
+
+  // RP207: does this Enter send? A finger keyboard (coarse pointer) keeps Enter for the new line and sends with Ctrl or Cmd; Shift and an IME composition never send.
+  const enterSends = ({ shift, ctrl, meta, composing, coarse } = {}) => !shift && !composing && (!coarse || !!(ctrl || meta));
+
+  // RP208 (S19): the height of the message box. `scroll` is the scrollHeight measured with the height on auto, `line` the computed line height, `pad` the vertical padding and `view` the visible height (visualViewport).
+  // It grows with the text up to `lines` lines and `share` of the visible height, never below one line; beyond that it scrolls inside. A measure that is not a number counts as one line.
+  const boxFit = ({ scroll, line, pad, view, lines = 10, share = 0.4 } = {}) => {
+    const num = (n, d) => (typeof n === 'number' && Number.isFinite(n) ? n : d);
+    const ln = Math.max(1, num(line, 20));
+    const pd = Math.max(0, num(pad, 0));
+    const one = ln + pd;
+    const cap = Math.max(one, Math.min(lines * ln + pd, num(view, Infinity) * share));
+    const sc = num(scroll, 0) > 0 ? scroll : one;
+    const rows = Math.max(1, Math.round((sc - pd) / ln));
+    return { height: Math.min(Math.max(sc, one), cap), scrolls: sc - cap > 1, rows, expandable: rows > 4 };
+  };
+  return { boxFit, enterSends, STALLED_MS, stalledNow, jobsHold, deliveryHold, tasksPollDue, TASKS_REFRESH_MS, mergeWhy, mergeNote, screenOf, bandOf, NARROW_BELOW, DUO_BELOW, parseAddress, addressOf, ADDRESS_ZONES, subClock, columnTabFor, conformityTabLabel, repoModel, changeChips, prChip, ciOf, idleChip, conflictChip, sizeChip, RepoCard, stateLineHidden, usageView, usageHtml, ringGeometry, usageRemaining, boardApply, boardWait, chatCachePut, chatCacheGet, rpcWithContext, chatFromCache, API_VERSION, mergeButton, rerunButton, isRefreshing, LOCAL_REFRESH_MS, HOT_REFRESH_MS, FULL_REFRESH_MS, SENT_POLL_MS, isHotRepo, refreshPlan, runColor, QUIET_MS, quietPeriod, dirtyRepos, sendingVerdict, ANIM_MS, animDelay, flowVerdict, runningReason, commitAllowed, commitOverrideItem, staleChipTitle, stateLine, manualAction, prAction, flowButtons, sentToast, fixPrAction, localPlacement, boardPlacement, boardColumns, isProblem, prColumn, prRank, sortPrCards, commitVerdict, queueFlags, taskPrs, matchesUnitId, isOutdated, conformityView, reqFold, cardWarning, cardMenu, roomOfRepo, roomTag, roomMenu, roomIssuesNotice, parseSse, rpcEvent, rpcReduce, rpcFromStatus, shellInHistory, CAUSE_TEXT, endedNote, eventsPlan, eventsRetryMs, eventsStale, projectRepos, roomOfFolder, roomMembers, columnTabOf, mergeRooms };
+}));
